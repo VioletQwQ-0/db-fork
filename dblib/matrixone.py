@@ -462,6 +462,24 @@ class MatrixOneToolSuite(DBToolSuite):
         self._execute(f"INSERT IGNORE INTO {_qt(self._meta_db, BRANCHES_TABLE)} (name, db, gen) "
                       "VALUES (%s, %s, 0)", (MAIN_BRANCH, self.db_name))
 
+    def _rebase_attempt_store(self):
+        from .matrixone_rebase import RebaseAttemptStore
+        return RebaseAttemptStore(lambda: connect(None), self._meta_db)
+
+    def _prepare_native_rebase_attempt(self, ref: Ref, onto: Ref):
+        """Prepare durable intent only; no snapshot or publication is sent."""
+        if ref.commit or onto.commit:
+            raise self._unsupported("rebase", "native publication requires branch heads")
+        return self._rebase_attempt_store().prepare(ref.branch, onto.branch)
+
+    def list_rebase_attempts(self, branch: str, after=None, limit=100):
+        """MO-only bounded inspection; does not create or retry publications."""
+        return self._rebase_attempt_store().list_attempts(branch, after, limit)
+
+    def recover_rebase(self, attempt_id: str):
+        """Read an original attempt; pending outcomes retain their resources."""
+        return self._rebase_attempt_store().recover(attempt_id)
+
     def _registry_row(self, branch: str):
         rows = self._execute(f"SELECT db, gen FROM {_qt(self._meta_db, BRANCHES_TABLE)} "
                              "WHERE name = %s", (branch,))
