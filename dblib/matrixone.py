@@ -470,7 +470,21 @@ class MatrixOneToolSuite(DBToolSuite):
         """Prepare durable intent only; no snapshot or publication is sent."""
         if ref.commit or onto.commit:
             raise self._unsupported("rebase", "native publication requires branch heads")
-        return self._rebase_attempt_store().prepare(ref.branch, onto.branch)
+        source, upstream = self._registry_row(ref.branch), self._registry_row(onto.branch)
+        if source is None or upstream is None or source[0] == upstream[0]:
+            raise ValueError("native Rebase requires two registered branch heads")
+        bases = self._base_rows(source[0], upstream[0])
+        relation = self._relation(source[0], upstream[0], bases)
+        if relation is None:
+            raise self._unsupported("rebase", "native publication requires a recorded common base")
+        row = relation[2]
+        child_base = (row["db"], row["snap"])
+        parent_base = (row["prev_db"], row["prev_snap"])
+        feature_base, upstream_base = ((child_base, parent_base) if relation[0] == source[0]
+                                       else (parent_base, child_base))
+        return self._rebase_attempt_store().prepare(
+            ref.branch, onto.branch, source_registration=source, upstream_registration=upstream,
+            feature_base=feature_base, upstream_base=upstream_base, base_sequence=row["seq"])
 
     def _request_native_rebase_snapshots(self, attempt_id: str):
         """Disabled-path preparation only; never publishes or retries an attempt."""

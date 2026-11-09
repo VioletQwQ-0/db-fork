@@ -6,7 +6,7 @@ import pymysql
 import pytest
 
 from dblib import matrixone as mo
-from dblib.db_api import Ref
+from dblib.db_api import Ref, UnsupportedOperation
 
 
 def suite():
@@ -21,6 +21,56 @@ def fork_row(seq, kind="fork", parent="parent"):
     row.update(seq=seq, id=f"c{seq}", kind=kind, db="child", snap=f"s{seq}",
                prev_db=parent, prev_snap="base", schema_json="{}")
     return row
+
+
+@pytest.mark.parametrize("child_is_feature", [True, False])
+def test_native_intent_binds_base_direction_and_resolved_generations(child_is_feature):
+    s = suite()
+    s.db_name = "bench"
+    source, upstream = ("bench__feature__g3", 3), ("bench__upstream__g4", 4)
+    s._registry_row = Mock(side_effect=[source, upstream])
+    child = source[0] if child_is_feature else upstream[0]
+    parent = "bench__upstream__g1" if child_is_feature else "bench__feature__g2"
+    row = fork_row(123, "rebase", parent)
+    row.update(db=child, snap="fixed_child_base", prev_snap="fixed_parent_base")
+    root = fork_row(10, "root")
+    s._base_rows = Mock(return_value=[row, root] if child_is_feature else [root, row])
+    store = Mock()
+    s._rebase_attempt_store = Mock(return_value=store)
+
+    assert s._prepare_native_rebase_attempt(Ref("feature"), Ref("upstream")) == store.prepare.return_value
+    child_base, parent_base = (child, "fixed_child_base"), (parent, "fixed_parent_base")
+    feature_base, upstream_base = ((child_base, parent_base) if child_is_feature
+                                   else (parent_base, child_base))
+    store.prepare.assert_called_once_with(
+        "feature", "upstream", source_registration=source, upstream_registration=upstream,
+        feature_base=feature_base, upstream_base=upstream_base, base_sequence=123)
+    s._base_rows.assert_called_once_with(source[0], upstream[0])
+
+
+def test_native_intent_rejects_unrecorded_common_base_without_snapshot_or_prepare():
+    s = suite()
+    s.db_name = "bench"
+    s._registry_row = Mock(side_effect=[("bench__feature", 0), ("bench", 0)])
+    s._base_rows = Mock(return_value=[fork_row(1, "root"), fork_row(2, "root")])
+    s._rebase_attempt_store = Mock()
+    with pytest.raises(UnsupportedOperation, match="recorded common base"):
+        s._prepare_native_rebase_attempt(Ref("feature"), Ref("main"))
+    s._rebase_attempt_store.assert_not_called()
+
+
+@pytest.mark.parametrize("source,upstream", [(None, ("bench", 0)),
+                                               (("bench__feature", 0), None),
+                                               (("bench", 0), ("bench", 0))])
+def test_native_intent_requires_both_distinct_registrations(source, upstream):
+    s = suite()
+    s._registry_row = Mock(side_effect=[source, upstream])
+    s._base_rows = Mock()
+    s._rebase_attempt_store = Mock()
+    with pytest.raises(ValueError, match="registered branch heads"):
+        s._prepare_native_rebase_attempt(Ref("feature"), Ref("main"))
+    s._base_rows.assert_not_called()
+    s._rebase_attempt_store.assert_not_called()
 
 
 def test_base_rows_preserve_input_order_and_independent_alias_results():

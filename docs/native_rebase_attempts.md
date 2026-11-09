@@ -17,6 +17,20 @@ snapshot or publication. The source branch row is locked while the intent is
 assembled; source inventory is scoped by account and database ID. Later
 publication must revalidate both the token and registry relation.
 
+The immutable intent also binds both old base endpoints, their database IDs,
+snapshot UUIDs/timestamps, and the base log sequence. The adapter uses its
+existing lineage resolver once and passes the two observed registrations to
+`prepare`; a changed source or upstream generation rejects that stale
+resolution. In the intent transaction, both base snapshots must exist in the
+current account and match their recorded database names. No two-way/no-base
+fallback is allowed on this restricted native path. Recovery decodes these
+original endpoints, never chooses a new fork point from current history.
+This is identity validation, not yet snapshot lifetime/GC protection; the
+kernel must protect and validate the exact endpoints before publication.
+Incomplete intents from the earlier, unreleased draft are rejected without
+inventing bases or deleting resources. The production benchmark path is
+unchanged and does not invoke this preparation helper.
+
 An attempt ID is a full 128-bit identifier. Its candidate and snapshot names
 are allocated once and remain within the server's 64-character limit. Epoch
 exhaustion and generation overflow fail before the intent insert. Failed
@@ -117,9 +131,11 @@ tests may be developed independently; real request and adapter-process exits
 remain required before R2 acceptance. This owner design is accepted for the
 disabled adapter stage, not evidence of runtime correctness.
 
-The focused offline suite contains 34 tests, including the original 18 intent
-cases. It verifies acknowledged reservation before request, branch/attempt lock
-order, two independent autocommit requests, confirmed receipt reuse, commit
-uncertainty, stale generations, receipt corruption and connection release.
-All pass locally; real snapshot execution, competing publication and actual
-adapter subprocess exits remain NOT_RUN. No result is a performance sample.
+The focused offline suites cover acknowledged reservation before request,
+branch/attempt lock order, independent autocommit requests, confirmed receipt
+reuse, commit uncertainty, stale generations, corruption and connection release.
+The adapter metadata cases also check both child/parent orientations, bases in
+older generations, registration changes during lineage resolution, and recovery
+without re-reading current history. These local DB-API/source integration tests
+do not close lifetime, transaction, process-recovery or publication acceptance.
+No result from this preparation stage is a performance sample.

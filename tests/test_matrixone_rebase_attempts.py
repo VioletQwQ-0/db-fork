@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, Mock
 from dblib.matrixone_rebase import (
     RebaseAttemptStore,
     RebaseAttemptUnknown,
+    RebaseBase,
     RebaseIntent,
 )
 
@@ -15,10 +16,20 @@ from dblib.matrixone_rebase import (
 ATTEMPT = "0123456789abcdef0123456789abcdef"
 
 
+def base(database="bench_feature", snapshot="base_feature", database_id=17):
+    return RebaseBase(database, snapshot, database_id,
+                      "12345678-1234-1234-1234-123456789abc", 12345)
+
+
+def base_record(value):
+    return (value.snapshot_uuid, value.snapshot_ts, "database", value.database, value.database_id)
+
+
 def intent(attempt_id=ATTEMPT):
     return RebaseIntent(attempt_id, "feature", "bench_feature", 17, 3, 0,
                         "candidate_" + attempt_id, 1, "bench", 11,
-                        "feature_" + attempt_id, "upstream_" + attempt_id)
+                        "feature_" + attempt_id, "upstream_" + attempt_id,
+                        base(), base("bench", "base_upstream", 11), 42)
 
 
 def record(state="PREPARING", value=None, result=None):
@@ -33,26 +44,37 @@ class AttemptStoreTest(unittest.TestCase):
         self.conn.get_autocommit.return_value = True
         self.cur = self.conn.cursor.return_value.__enter__.return_value
         self.cur.fetchone.side_effect = [("bench_feature", 0), ("bench", 0)]
-        self.cur.fetchall.side_effect = [[(17, 3)], [(11,)]]
+        self.cur.fetchall.side_effect = [[(17, 3)], [(11,)],
+                                        [base_record(base())],
+                                        [base_record(base("bench", "base_upstream", 11))]]
         self.cur.rowcount = 1
         self.connect = Mock(return_value=self.conn)
         self.store = RebaseAttemptStore(self.connect, "bench_meta")
+
+    def prepare(self, *args, **kwargs):
+        inputs = dict(source_registration=("bench_feature", 0), upstream_registration=("bench", 0),
+                      feature_base=("bench_feature", "base_feature"),
+                      upstream_base=("bench", "base_upstream"), base_sequence=42)
+        inputs.update(kwargs)
+        return self.store.prepare(*args, **inputs)
 
     def test_prepare_commits_one_fixed_intent_without_snapshot_or_publication(self):
         events = Mock()
         events.attach_mock(self.cur.execute, "execute")
         events.attach_mock(self.conn.begin, "begin")
         events.attach_mock(self.conn.commit, "commit")
-        result = self.store.prepare("feature", "main", ATTEMPT)
+        result = self.prepare("feature", "main", ATTEMPT)
         self.assertEqual((result.source_id, result.source_epoch, result.old_generation), (17, 3, 0))
         self.assertIn(ATTEMPT, result.candidate_db)
         self.assertLessEqual(len(result.candidate_db), 64)
         statements = [call.args for call in self.cur.execute.call_args_list]
-        self.assertEqual(len(statements), 8)
+        self.assertEqual(len(statements), 10)
         self.assertIn("rebase_snapshot_requests", statements[1][0])
         self.assertIn("FOR UPDATE", statements[3][0])
         self.assertIn("current_account_id()", statements[5][0])
         self.assertIn("current_account_id()", statements[6][0])
+        self.assertEqual(statements[7][1], ("base_feature",))
+        self.assertEqual(statements[8][1], ("base_upstream",))
         self.assertEqual(statements[-1][1][:3], (ATTEMPT, "feature", "PREPARING"))
         self.assertEqual(json.loads(statements[-1][1][3]), asdict(result))
         self.assertFalse(any("SNAPSHOT" in sql[0] or "REBASE" in sql[0]
@@ -67,7 +89,7 @@ class AttemptStoreTest(unittest.TestCase):
     def test_commit_loss_is_unknown_without_retry_or_rollback(self):
         self.conn.commit.side_effect = OSError("lost commit response")
         with self.assertRaises(RebaseAttemptUnknown) as caught:
-            self.store.prepare("feature", "main", ATTEMPT)
+            self.prepare("feature", "main", ATTEMPT)
         self.assertEqual(caught.exception.attempt_id, ATTEMPT)
         self.conn.commit.assert_called_once()
         self.conn.rollback.assert_not_called()
@@ -80,7 +102,7 @@ class AttemptStoreTest(unittest.TestCase):
                 raise RuntimeError("duplicate attempt")
         self.cur.execute.side_effect = execute
         with self.assertRaisesRegex(RuntimeError, "duplicate attempt"):
-            self.store.prepare("feature", "main", ATTEMPT)
+            self.prepare("feature", "main", ATTEMPT)
         self.conn.rollback.assert_called_once()
         self.conn.commit.assert_not_called()
         self.connect.assert_called_once()
@@ -90,7 +112,7 @@ class AttemptStoreTest(unittest.TestCase):
         self.cur.rowcount = 0
         self.conn.rollback.side_effect = OSError("lost rollback response")
         with self.assertRaises(RebaseAttemptUnknown) as caught:
-            self.store.prepare("feature", "main", ATTEMPT)
+            self.prepare("feature", "main", ATTEMPT)
         self.assertEqual(caught.exception.attempt_id, ATTEMPT)
         self.conn.commit.assert_not_called()
 
@@ -101,7 +123,7 @@ class AttemptStoreTest(unittest.TestCase):
                 self.setUp()
                 self.cur.fetchone.side_effect = rows
                 with self.assertRaises(ValueError):
-                    self.store.prepare("feature", "main", ATTEMPT)
+                    self.prepare("feature", "main", ATTEMPT)
                 self.conn.rollback.assert_called_once()
                 self.conn.commit.assert_not_called()
 
@@ -109,9 +131,10 @@ class AttemptStoreTest(unittest.TestCase):
         for rows in ([], [(17, 3), (17, 4)], [(17, 0)], [(17, 2 ** 64 - 1)]):
             with self.subTest(rows=rows):
                 self.setUp()
-                self.cur.fetchall.side_effect = [rows, [(11,)]]
+                self.cur.fetchall.side_effect = [rows, [(11,)], [base_record(base())],
+                                                [base_record(base("bench", "base_upstream", 11))]]
                 with self.assertRaises(ValueError):
-                    self.store.prepare("feature", "main", ATTEMPT)
+                    self.prepare("feature", "main", ATTEMPT)
                 self.assertFalse(any(call.args[0].startswith("INSERT")
                                      for call in self.cur.execute.call_args_list))
                 self.conn.rollback.assert_called_once()
@@ -120,13 +143,13 @@ class AttemptStoreTest(unittest.TestCase):
         for args in (("", "main", ATTEMPT), ("feature", "main", "bad"),
                      ("feature", "x" * 65, ATTEMPT)):
             with self.subTest(args=args), self.assertRaises(ValueError):
-                self.store.prepare(*args)
+                self.prepare(*args)
         self.connect.assert_not_called()
 
     def test_nonfresh_connection_cannot_own_intent_transaction(self):
         self.conn.get_autocommit.return_value = False
         with self.assertRaises(ValueError):
-            self.store.prepare("feature", "main", ATTEMPT)
+            self.prepare("feature", "main", ATTEMPT)
         self.cur.execute.assert_not_called()
         self.conn.begin.assert_not_called()
         self.conn.close.assert_called_once()
@@ -221,6 +244,81 @@ class AttemptStoreTest(unittest.TestCase):
                        {"upstream_snapshot": intent().feature_snapshot}):
             with self.subTest(values=values), self.assertRaises(ValueError):
                 replace(intent(), **values)
+
+    def test_preparing_intent_keeps_both_original_bases_after_branch_moves(self):
+        value = intent()
+        self.cur.fetchall.side_effect = [[record(value=value)], []]
+        outcome = self.store.recover(ATTEMPT)
+        self.assertEqual(outcome["state"], "UNKNOWN")
+        self.assertEqual(outcome["intent"]["feature_base"], asdict(value.feature_base))
+        self.assertEqual(outcome["intent"]["upstream_base"], asdict(value.upstream_base))
+        self.assertEqual(outcome["intent"]["base_sequence"], 42)
+        self.cur.fetchone.assert_not_called()
+        self.assertFalse(any("branches" in call.args[0] or "_bb_commits" in call.args[0]
+                             for call in self.cur.execute.call_args_list))
+
+    def test_generation_change_while_bases_are_resolved_prevents_intent(self):
+        for rows in ((("replacement", 0),), (("bench_feature", 1),),
+                     (("bench_feature", 0), ("replacement_upstream", 0)),
+                     (("bench_feature", 0), ("bench", 1))):
+            with self.subTest(rows=rows):
+                self.setUp()
+                self.cur.fetchone.side_effect = rows
+                with self.assertRaisesRegex(ValueError, "generation changed"):
+                    self.prepare("feature", "main", ATTEMPT)
+                self.conn.rollback.assert_called_once()
+                self.conn.commit.assert_not_called()
+                self.assertFalse(any(call.args[0].startswith("INSERT")
+                                     for call in self.cur.execute.call_args_list))
+
+    def test_missing_or_invalid_base_snapshot_rolls_back_before_intent(self):
+        valid = base_record(base())
+        for bad in ([], [valid, valid], [(valid[0], valid[1], "table", valid[3], valid[4])],
+                    [(valid[0], valid[1], "database", "other", valid[4])],
+                    [(valid[0], valid[1], "database", valid[3], 0)],
+                    [("bad_uuid", valid[1], "database", valid[3], valid[4])],
+                    [(valid[0], 0, "database", valid[3], valid[4])]):
+            for role in ("feature", "upstream"):
+                with self.subTest(bad=bad, role=role):
+                    self.setUp()
+                    self.cur.fetchall.side_effect = [[(17, 3)], [(11,)]] + (
+                        [bad] if role == "feature" else [[valid], bad])
+                    with self.assertRaises(ValueError):
+                        self.prepare("feature", "main", ATTEMPT)
+                    self.conn.rollback.assert_called_once()
+                    self.conn.commit.assert_not_called()
+                    self.assertFalse(any(call.args[0].startswith("INSERT")
+                                         for call in self.cur.execute.call_args_list))
+
+    def test_invalid_resolved_base_inputs_do_not_open_connection(self):
+        for values in ({"feature_base": ("db", None)}, {"upstream_base": ("db",)},
+                       {"source_registration": ("db", True)},
+                       {"upstream_registration": ("db", -1)},
+                       {"base_sequence": 0}, {"base_sequence": True}):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                self.prepare("feature", "main", ATTEMPT, **values)
+        self.connect.assert_not_called()
+
+    def test_missing_base_in_old_draft_intent_is_not_invented_on_recovery(self):
+        value = asdict(intent())
+        del value["feature_base"]
+        self.cur.fetchall.side_effect = [[(ATTEMPT, "PREPARING", json.dumps(value), None)]]
+        with self.assertRaisesRegex(ValueError, "fixed bases are required"):
+            self.store.recover(ATTEMPT)
+        self.assertEqual(self.cur.execute.call_count, 1)
+        self.conn.begin.assert_not_called()
+
+    def test_fixed_base_fields_are_validated_when_decoding_persistent_intent(self):
+        for change in ({"database_id": True}, {"snapshot_ts": -1}, {"snapshot_uuid": "bad"},
+                       {"snapshot": ""}, {"unexpected": 1}):
+            with self.subTest(change=change):
+                self.setUp()
+                value = asdict(intent())
+                value["feature_base"].update(change)
+                self.cur.fetchall.side_effect = [[(ATTEMPT, "PREPARING", json.dumps(value), None)]]
+                with self.assertRaisesRegex(ValueError, "fixed bases are required"):
+                    self.store.recover(ATTEMPT)
+                self.assertEqual(self.cur.execute.call_count, 1)
 
 
 if __name__ == "__main__":

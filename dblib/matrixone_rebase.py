@@ -59,6 +59,24 @@ def _attempt_id(value):
 
 
 @dataclass(frozen=True)
+class RebaseBase:
+    database: str
+    snapshot: str
+    database_id: int
+    snapshot_uuid: str
+    snapshot_ts: int
+
+    def __post_init__(self):
+        _identifier(self.database)
+        _identifier(self.snapshot)
+        if (type(self.database_id) is not int or not 0 < self.database_id < 2 ** 64
+                or type(self.snapshot_ts) is not int or not 0 < self.snapshot_ts < 2 ** 63
+                or not isinstance(self.snapshot_uuid, str)
+                or str(uuid.UUID(self.snapshot_uuid)) != self.snapshot_uuid):
+            raise ValueError("invalid Rebase base snapshot identity")
+
+
+@dataclass(frozen=True)
 class RebaseIntent:
     attempt_id: str
     branch: str
@@ -72,10 +90,20 @@ class RebaseIntent:
     upstream_id: int
     feature_snapshot: str
     upstream_snapshot: str
+    feature_base: RebaseBase
+    upstream_base: RebaseBase
+    base_sequence: int
     protocol: int = 1
 
     def __post_init__(self):
         _attempt_id(self.attempt_id)
+        for field in ("feature_base", "upstream_base"):
+            base = getattr(self, field)
+            if isinstance(base, dict):
+                base = RebaseBase(**base)
+                object.__setattr__(self, field, base)
+            if not isinstance(base, RebaseBase):
+                raise ValueError("missing fixed Rebase base")
         for value in (self.branch, self.source_db, self.candidate_db, self.upstream_db,
                       self.feature_snapshot, self.upstream_snapshot):
             _identifier(value)
@@ -89,6 +117,7 @@ class RebaseIntent:
                 or self.new_generation != self.old_generation + 1):
             raise ValueError("invalid Rebase generation")
         if (type(self.protocol) is not int or self.protocol != 1
+                or type(self.base_sequence) is not int or not 0 < self.base_sequence < 2 ** 63
                 or self.candidate_db in (self.source_db, self.upstream_db)
                 or self.source_db == self.upstream_db
                 or self.feature_snapshot == self.upstream_snapshot):
@@ -133,7 +162,20 @@ class RebaseAttemptStore:
                         raise RebaseAttemptUnknown(attempt_id) from exc
                 raise
 
-    def prepare(self, branch, upstream_branch, attempt_id=None):
+    @staticmethod
+    def _read_base(cur, endpoint):
+        database, snapshot = endpoint
+        cur.execute("SELECT cast(snapshot_id as char(36)),ts,level,database_name,obj_id "
+                    "FROM mo_catalog.mo_snapshots "
+                    "WHERE sname=%s AND account_name=current_account_name()", (snapshot,))
+        rows = cur.fetchall()
+        if len(rows) != 1 or rows[0][2:4] != ("database", database):
+            raise ValueError("missing or mismatched Rebase base snapshot")
+        snapshot_uuid, ts, _, _, database_id = rows[0]
+        return RebaseBase(database, snapshot, database_id, snapshot_uuid, ts)
+
+    def prepare(self, branch, upstream_branch, attempt_id=None, *, source_registration,
+                upstream_registration, feature_base, upstream_base, base_sequence):
         """Persist fixed token and resource names before any snapshot request.
 
         This is not a publish operation. Its returned intent must be passed to
@@ -142,15 +184,32 @@ class RebaseAttemptStore:
         _identifier(branch)
         _identifier(upstream_branch)
         attempt_id = _attempt_id(attempt_id if attempt_id is not None else uuid.uuid4().hex)
+        for registration in (source_registration, upstream_registration):
+            if not isinstance(registration, tuple) or len(registration) != 2:
+                raise ValueError("invalid Rebase source registration")
+            _identifier(registration[0])
+            if type(registration[1]) is not int or not 0 <= registration[1] < 2 ** 31 - 1:
+                raise ValueError("invalid Rebase registration generation")
+        for endpoint in (feature_base, upstream_base):
+            if not isinstance(endpoint, tuple) or len(endpoint) != 2:
+                raise ValueError("invalid Rebase base endpoint")
+            for name in endpoint:
+                _identifier(name)
+        if type(base_sequence) is not int or not 0 < base_sequence < 2 ** 63:
+            raise ValueError("invalid Rebase base sequence")
         with self._transaction(attempt_id, initialize=True) as cur:
             cur.execute(f"SELECT db, gen FROM {self._branches} WHERE name=%s FOR UPDATE", (branch,))
             source = cur.fetchone()
             if source is None:
                 raise ValueError("unknown source branch")
+            if source != source_registration:
+                raise ValueError("Rebase source generation changed during base resolution")
             cur.execute(f"SELECT db, gen FROM {self._branches} WHERE name=%s", (upstream_branch,))
             upstream = cur.fetchone()
             if upstream is None or source[0] == upstream[0]:
                 raise ValueError("unknown upstream or identical branch")
+            if upstream != upstream_registration:
+                raise ValueError("Rebase upstream generation changed during base resolution")
             cur.execute("SELECT d.dat_id, i.epoch FROM mo_catalog.mo_database d "
                         "JOIN mo_catalog.mo_database_inventory i "
                         "ON i.account_id=d.account_id AND i.database_id=d.dat_id "
@@ -164,12 +223,13 @@ class RebaseAttemptStore:
             rows = cur.fetchall()
             if len(rows) != 1:
                 raise ValueError("missing or ambiguous upstream identity")
-            gen = int(source[1])
+            gen = source[1]
             prefix = hashlib.sha256((self._attempts + "\x00" + branch).encode()).hexdigest()[:12]
             intent = RebaseIntent(
-                attempt_id, branch, source[0], int(source_id), int(epoch), gen,
+                attempt_id, branch, source[0], source_id, epoch, gen,
                 f"bb_r2_{prefix}_{gen + 1}_{attempt_id}", gen + 1,
-                upstream[0], int(rows[0][0]), f"bb_r2_f_{attempt_id}", f"bb_r2_u_{attempt_id}")
+                upstream[0], rows[0][0], f"bb_r2_f_{attempt_id}", f"bb_r2_u_{attempt_id}",
+                self._read_base(cur, feature_base), self._read_base(cur, upstream_base), base_sequence)
             cur.execute(f"INSERT INTO {self._attempts} (attempt_id,branch,state,intent_json) "
                         "VALUES (%s,%s,%s,%s)",
                         (attempt_id, branch, "PREPARING", json.dumps(asdict(intent), sort_keys=True)))
@@ -346,7 +406,10 @@ class RebaseAttemptStore:
     @staticmethod
     def _decode(row):
         attempt_id, state, raw_intent, raw_result = row
-        intent = RebaseIntent(**json.loads(raw_intent))
+        try:
+            intent = RebaseIntent(**json.loads(raw_intent))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid persisted Rebase intent; fixed bases are required") from exc
         if attempt_id != intent.attempt_id or state not in ("PREPARING", "UNKNOWN", "COMMITTED", "ABORTED"):
             raise ValueError("invalid persisted Rebase attempt")
         result = json.loads(raw_result) if raw_result is not None else None
