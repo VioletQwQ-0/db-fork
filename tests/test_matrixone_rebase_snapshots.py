@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import MagicMock, Mock
 
 from dblib.matrixone_rebase import RebaseAttemptStore, RebaseAttemptUnknown
-from tests.test_matrixone_rebase_attempts import ATTEMPT, intent, record
+from tests.test_matrixone_rebase_attempts import ATTEMPT, base_record, intent, record
 
 
 def receipt(role="feature", confirmed=False):
@@ -47,12 +47,20 @@ class SnapshotRequestTest(unittest.TestCase):
     def add_inspection(self, resources=()):
         return self.add_connection([[record()], list(resources)])
 
+    def add_reservation(self, role="feature", branch=("bench_feature", 0)):
+        value = intent()
+        rows = [[record()], []]
+        if role == "upstream":
+            rows.append([receipt(confirmed=True)])
+        rows.extend([[base_record(value.feature_base)], [base_record(value.upstream_base)]])
+        return self.add_connection(rows, branch)
+
     def add_full_flow(self):
         self.add_inspection()
-        self.add_connection([[record()], []])
+        self.add_reservation()
         self.add_connection([[snapshot()]])
         self.add_connection([[record()], [receipt()]])
-        self.add_connection([[record()], [], [receipt(confirmed=True)]])
+        self.add_reservation("upstream")
         self.add_connection([[snapshot("upstream")]])
         self.add_connection([[record()], [receipt("upstream")]])
 
@@ -89,7 +97,7 @@ class SnapshotRequestTest(unittest.TestCase):
 
     def test_unknown_reservation_commit_never_sends_request(self):
         self.add_inspection()
-        conn, _ = self.add_connection([[record()], []])
+        conn, _ = self.add_reservation()
         conn.commit.side_effect = OSError("commit response lost")
         with self.assertRaises(RebaseAttemptUnknown):
             self.store.request_snapshots(ATTEMPT)
@@ -100,7 +108,7 @@ class SnapshotRequestTest(unittest.TestCase):
 
     def test_failed_reservation_rolls_back_and_sends_nothing(self):
         self.add_inspection()
-        conn, cur = self.add_connection([[record()], []])
+        conn, cur = self.add_reservation()
         cur.rowcount = 0
         with self.assertRaises(RuntimeError):
             self.store.request_snapshots(ATTEMPT)
@@ -133,7 +141,7 @@ class SnapshotRequestTest(unittest.TestCase):
             with self.subTest(failure=type(failure).__name__):
                 self.setUp()
                 self.add_inspection()
-                self.add_connection([[record()], []])
+                self.add_reservation()
                 conn, cur = self.add_connection([])
                 cur.execute.side_effect = failure
                 with self.assertRaises(KeyboardInterrupt if isinstance(failure, KeyboardInterrupt) else RebaseAttemptUnknown):
@@ -155,7 +163,7 @@ class SnapshotRequestTest(unittest.TestCase):
             with self.subTest(rows=rows):
                 self.setUp()
                 self.add_inspection()
-                self.add_connection([[record()], []])
+                self.add_reservation()
                 self.add_connection([rows])
                 with self.assertRaises(RebaseAttemptUnknown):
                     self.store.request_snapshots(ATTEMPT)
@@ -165,7 +173,7 @@ class SnapshotRequestTest(unittest.TestCase):
 
     def test_confirmation_commit_unknown_stops_before_upstream_request(self):
         self.add_inspection()
-        self.add_connection([[record()], []])
+        self.add_reservation()
         self.add_connection([[snapshot()]])
         conn, _ = self.add_connection([[record()], [receipt()]])
         conn.commit.side_effect = OSError("confirmation response lost")
@@ -188,7 +196,7 @@ class SnapshotRequestTest(unittest.TestCase):
             with self.subTest(branch=branch):
                 self.setUp()
                 self.add_inspection()
-                conn, _ = self.add_connection([[record()], []], branch)
+                conn, _ = self.add_reservation(branch=branch)
                 with self.assertRaises(ValueError):
                     self.store.request_snapshots(ATTEMPT)
                 self.assertEqual(self.snapshot_statements(), [])
@@ -237,7 +245,7 @@ class SnapshotRequestTest(unittest.TestCase):
 
     def test_snapshot_connection_must_be_autocommit(self):
         self.add_inspection()
-        self.add_connection([[record()], []])
+        self.add_reservation()
         conn, cur = self.add_connection([])
         conn.get_autocommit.return_value = False
         with self.assertRaises(RebaseAttemptUnknown):
@@ -253,6 +261,59 @@ class SnapshotRequestTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.store.request_snapshots(ATTEMPT)
         self.assertEqual(self.connect.call_count, 1)
+        self.assert_no_publication_or_cleanup()
+
+    def test_replaced_base_identity_blocks_request_before_reservation_insert(self):
+        fixed = intent()
+        original = base_record(fixed.feature_base)
+        changed = [("22345678-1234-1234-1234-123456789abc", *original[1:]),
+                   (original[0], original[1] + 1, *original[2:]),
+                   (*original[:4], original[4] + 1)]
+        for actual in changed:
+            with self.subTest(actual=actual):
+                self.setUp()
+                self.add_inspection()
+                conn, cur = self.add_connection([[record()], [], [actual]])
+                with self.assertRaisesRegex(ValueError, "base snapshot identity changed"):
+                    self.store.request_snapshots(ATTEMPT)
+                conn.rollback.assert_called_once()
+                conn.commit.assert_not_called()
+                self.assertEqual(cur.execute.call_args.args[1], (fixed.feature_base.snapshot,))
+                self.assertFalse(any(call.args[0].startswith("INSERT") for call in cur.execute.call_args_list))
+                self.assertEqual(self.snapshot_statements(), [])
+                self.assert_no_publication_or_cleanup()
+
+    def test_lost_base_between_requests_retains_confirmed_feature_without_upstream_send(self):
+        fixed = intent()
+        self.add_inspection()
+        self.add_reservation()
+        self.add_connection([[snapshot()]])
+        confirmed, _ = self.add_connection([[record()], [receipt()]])
+        stopped, cur = self.add_connection([[record()], [], [receipt(confirmed=True)],
+                                            [base_record(fixed.feature_base)], []])
+        with self.assertRaisesRegex(ValueError, "missing or mismatched Rebase base snapshot"):
+            self.store.request_snapshots(ATTEMPT)
+        confirmed.commit.assert_called_once()
+        stopped.rollback.assert_called_once()
+        stopped.commit.assert_not_called()
+        self.assertEqual(len(self.snapshot_statements()), 1)
+        self.assertFalse(any(call.args[0].startswith("INSERT") for call in cur.execute.call_args_list))
+        self.assert_no_publication_or_cleanup()
+
+    def test_base_read_error_does_not_create_abort_or_delete_resources(self):
+        self.add_inspection()
+        conn, cur = self.add_reservation()
+        def execute(query, params=None):
+            if "FROM mo_catalog.mo_snapshots" in query:
+                raise OSError("snapshot metadata read failed")
+        cur.execute.side_effect = execute
+        with self.assertRaisesRegex(OSError, "metadata read failed"):
+            self.store.request_snapshots(ATTEMPT)
+        conn.rollback.assert_called_once()
+        conn.commit.assert_not_called()
+        self.assertFalse(any(call.args[0].startswith(("INSERT", "UPDATE", "DELETE"))
+                             for call in cur.execute.call_args_list))
+        self.assertEqual(self.snapshot_statements(), [])
         self.assert_no_publication_or_cleanup()
 
 

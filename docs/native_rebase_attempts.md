@@ -113,6 +113,14 @@ sends no snapshot request. A pre-existing REQUESTED row is UNKNOWN and must not
 be reissued; a valid CONFIRMED row may be reused without another CREATE.
 Upstream preparation requires a confirmed feature receipt.
 
+Before inserting a new REQUESTED row, the same metadata owner checks both
+original base snapshot identities against the immutable intent. Missing or
+rebound names stop this preparation, including between the feature and upstream
+requests; already-confirmed feature resources are retained. Reusing a confirmed
+receipt does not create another request. This early check does not pin snapshots
+against later GC or replace the publication transaction's protected endpoint
+validation. A read error is not ABORTED evidence and never triggers cleanup.
+
 After a successful snapshot response, query its UUID, timestamp and database ID
 from the current account's snapshot catalog. Verify level/name/ID against the
 intent and persist a CONFIRMED receipt under the same branch-before-attempt

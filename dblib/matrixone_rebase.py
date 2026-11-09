@@ -301,6 +301,11 @@ class RebaseAttemptStore:
                 feature = self._read_snapshot_requests(cur, intent, "feature")
                 if not feature or feature[0]["state"] != "CONFIRMED":
                     raise RebaseAttemptUnknown(intent.attempt_id)
+            # Reject already-stale inputs before allocating another resource.
+            # This check is not the publication transaction's required GC pin.
+            for fixed in (intent.feature_base, intent.upstream_base):
+                if self._read_base(cur, (fixed.database, fixed.snapshot)) != fixed:
+                    raise ValueError("Rebase base snapshot identity changed before request")
             cur.execute(f"INSERT INTO {self._requests} "
                         "(attempt_id,role,state,snapshot_name,database_id) VALUES (%s,%s,%s,%s,%s)",
                         (intent.attempt_id, role, "REQUESTED", name, database_id))
