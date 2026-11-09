@@ -705,11 +705,19 @@ class MatrixOneToolSuite(DBToolSuite):
         that made one of the two databases a clone of the other, or None
         when neither descends from the other."""
         x_base, y_base = self._base_rows(x_db, y_db) if base_rows is None else base_rows
+        relevant = [x_db, y_db] + [row["prev_db"] for row in (x_base, y_base)
+                                   if row["kind"] in ("fork", "rebase")]
+        branches = {db: branch_of_db(self.db_name, db) for db in relevant}
+        from .matrixone_rebase import native_generation_attempt
+        native_names = [db for db in relevant if db.lower() != self.db_name.lower()
+                        and native_generation_attempt(db) is not None]
+        if native_names:
+            branches.update(self._rebase_attempt_store().generation_branches(*native_names))
         cands = []
         for child, parent, row in ((x_db, y_db, x_base), (y_db, x_db, y_base)):
             # prev_db names the parent's generation at fork/rebase time.
             if (row["kind"] in ("fork", "rebase")
-                    and branch_of_db(self.db_name, row["prev_db"]) == branch_of_db(self.db_name, parent)):
+                    and branches[row["prev_db"]] == branches[parent]):
                 cands.append((child, parent, row))
         if not cands:
             return None

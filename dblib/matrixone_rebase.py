@@ -60,6 +60,14 @@ def _attempt_id(value):
     return value
 
 
+def native_generation_attempt(database):
+    """Recognize our allocated namespace, not an arbitrary generation suffix."""
+    _identifier(database)
+    match = re.fullmatch(r"bb_r2_[0-9a-f]{12}_[1-9][0-9]*_([0-9a-f]{32})",
+                         database, re.IGNORECASE)
+    return match[1].lower() if match else None
+
+
 @dataclass(frozen=True)
 class RebaseBase:
     database: str
@@ -135,6 +143,56 @@ class RebaseAttemptStore:
         self._attempts = f"{quoted}.`{ATTEMPTS_TABLE}`"
         self._branches = f"{quoted}.`branches`"
         self._requests = f"{quoted}.`{REQUESTS_TABLE}`"
+
+    def _candidate_database(self, branch, generation, attempt_id):
+        prefix = hashlib.sha256((self._attempts + "\x00" + branch).encode()).hexdigest()[:12]
+        return f"bb_r2_{prefix}_{generation}_{attempt_id}"
+
+    def generation_branches(self, *databases):
+        """Resolve up to four native physical names using committed identities."""
+        if len(databases) > 4:
+            raise ValueError("native generation lookup accepts at most four databases")
+        requested = {}
+        for database in databases:
+            attempt = native_generation_attempt(database)
+            if attempt is not None:
+                requested.setdefault(attempt, []).append(database)
+        if not requested:
+            return {}
+        ids = sorted(requested)
+        placeholders = ",".join("%s" for _ in ids)
+        with closing(self._connect()) as conn, conn.cursor() as cur:
+            cur.execute(f"SELECT attempt_id,state,intent_json,result_json FROM {self._attempts} "
+                        f"WHERE attempt_id IN ({placeholders}) ORDER BY attempt_id LIMIT %s",
+                        (*ids, len(ids) + 1))
+            rows = cur.fetchall()
+        seen, branches = set(), {}
+        for row in rows:
+            outcome = self._decode(row)
+            attempt = outcome["attempt_id"]
+            if attempt not in requested or attempt in seen:
+                raise ValueError("ambiguous native generation attempt")
+            seen.add(attempt)
+            intent = RebaseIntent(**outcome["intent"])
+            expected = self._candidate_database(intent.branch, intent.new_generation, attempt)
+            if (intent.candidate_db != expected
+                    or any(database.lower() != expected for database in requested[attempt])):
+                raise ValueError("native generation does not match its original resource")
+            if outcome["state"] == "ABORTED":
+                raise ValueError("aborted Rebase attempt is not a published generation")
+            if outcome["state"] != "COMMITTED":
+                raise RebaseAttemptUnknown(attempt)
+            result = outcome["result"]
+            if (result.get("candidate_db") != expected
+                    or type(result.get("generation")) is not int
+                    or result["generation"] != intent.new_generation):
+                raise ValueError("native generation result contradicts its intent")
+            for database in requested[attempt]:
+                branches[database] = intent.branch
+        for attempt in ids:
+            if attempt not in seen:
+                raise RebaseAttemptUnknown(attempt)
+        return branches
 
     @contextmanager
     def _transaction(self, attempt_id, initialize=False):
@@ -226,10 +284,9 @@ class RebaseAttemptStore:
             if len(rows) != 1:
                 raise ValueError("missing or ambiguous upstream identity")
             gen = source[1]
-            prefix = hashlib.sha256((self._attempts + "\x00" + branch).encode()).hexdigest()[:12]
             intent = RebaseIntent(
                 attempt_id, branch, source[0], source_id, epoch, gen,
-                f"bb_r2_{prefix}_{gen + 1}_{attempt_id}", gen + 1,
+                self._candidate_database(branch, gen + 1, attempt_id), gen + 1,
                 upstream[0], rows[0][0], f"bb_r2_f_{attempt_id}", f"bb_r2_u_{attempt_id}",
                 self._read_base(cur, feature_base), self._read_base(cur, upstream_base), base_sequence)
             cur.execute(f"INSERT INTO {self._attempts} (attempt_id,branch,state,intent_json) "

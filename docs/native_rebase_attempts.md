@@ -111,6 +111,28 @@ proof that two actual database transactions conflict or that a killed client
 recovers safely. No ABORTED writer, publication or resource reclamation is
 enabled by this slice.
 
+## Native Generation Identity
+
+The allocated candidate name is opaque to the legacy `branch_of_db` parser.
+That parser alone cannot relate a previous native upstream generation to its
+current generation during subsequent Rebase or Merge. Resolve the bounded set
+of relevant native names through their embedded attempt IDs and the existing
+attempt-table primary key, not by scanning history or adding a mapping table.
+Only immutable intent plus a matching COMMITTED result may identify a published
+generation. Verify the exact allocated name, metadata namespace and generation;
+pending/missing records remain UNKNOWN, and corrupt/aborted identities fail.
+Never fall back to string-derived branch identity for a recognized native name.
+
+The lineage caller resolves at most four names in one read, uses an operation-
+local map, and keeps the legacy path unchanged when no native names occur.
+The known benchmark root is never classified as a native generation, even if
+its chosen literal name happens to match that shape.
+Old generation identity survives current-pointer advances or physical database
+retirement because its successful attempt remains durable. This read-only
+identity slice is not a GC authorization, native publication or proof of the
+future base/history-writing protocol. Real repeated Rebase, subsequent Merge
+and lifecycle acceptance remain required before enabling R2.
+
 ## Snapshot Request Owner
 
 The next isolated stage adds at most two request rows per attempt in the same

@@ -69,6 +69,59 @@ def test_native_recovery_delegates_only_to_original_attempt():
     assert store.method_calls == [call.recover(attempt_id)]
 
 
+def test_relation_resolves_retired_and_current_native_generations_together():
+    from tests.test_matrixone_rebase_generations import candidate
+    s = suite()
+    s.db_name = "bench"
+    feature = candidate("feature", 3)
+    old_upstream = candidate("upstream", 2, "e" * 32)
+    current_upstream = candidate("upstream", 4, "f" * 32)
+    fork = fork_row(123, "rebase", old_upstream)
+    # A native base names the actual fixed U snapshot, not a nonexistent
+    # pre-replay snapshot on the candidate database.
+    fork.update(db=old_upstream, snap="fixed_u", prev_snap="fixed_u")
+    root = fork_row(1, "root")
+    store = Mock()
+    store.generation_branches.return_value = {
+        feature: "feature", old_upstream: "upstream", current_upstream: "upstream"}
+    s._rebase_attempt_store = Mock(return_value=store)
+    assert s._relation(feature, current_upstream, [fork, root]) == (feature, current_upstream, fork)
+    store.generation_branches.assert_called_once_with(feature, current_upstream, old_upstream)
+
+
+def test_native_generation_unknown_cannot_fall_back_to_name_parsing():
+    from dblib.matrixone_rebase import RebaseAttemptUnknown
+    from tests.test_matrixone_rebase_generations import ATTEMPT, candidate
+    s = suite()
+    s.db_name = "bench"
+    store = Mock()
+    store.generation_branches.side_effect = RebaseAttemptUnknown(ATTEMPT)
+    s._rebase_attempt_store = Mock(return_value=store)
+    with pytest.raises(RebaseAttemptUnknown):
+        s._relation(candidate(), "bench", [fork_row(2, "fork", "bench"), fork_row(1, "root")])
+
+
+def test_legacy_relation_needs_no_native_metadata_query():
+    s = suite()
+    s.db_name = "bench"
+    s._rebase_attempt_store = Mock(side_effect=AssertionError("unnecessary native metadata"))
+    row = fork_row(2, "fork", "bench")
+    assert s._relation("bench__feature", "bench", [row, fork_row(1, "root")]) == (
+        "bench__feature", "bench", row)
+    s._rebase_attempt_store.assert_not_called()
+
+
+def test_a_native_shaped_root_name_is_still_the_legacy_root():
+    from tests.test_matrixone_rebase_generations import candidate
+    s = suite()
+    s.db_name = candidate()
+    s._rebase_attempt_store = Mock(side_effect=AssertionError("root is not a native generation"))
+    child = s.db_name + "__feature"
+    row = fork_row(2, "fork", s.db_name)
+    assert s._relation(child, s.db_name, [row, fork_row(1, "root")]) == (child, s.db_name, row)
+    s._rebase_attempt_store.assert_not_called()
+
+
 @pytest.mark.parametrize("source,upstream", [(None, ("bench", 0)),
                                                (("bench__feature", 0), None),
                                                (("bench", 0), ("bench", 0))])
