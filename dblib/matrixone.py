@@ -472,6 +472,10 @@ class MatrixOneToolSuite(DBToolSuite):
             raise self._unsupported("rebase", "native publication requires branch heads")
         return self._rebase_attempt_store().prepare(ref.branch, onto.branch)
 
+    def _request_native_rebase_snapshots(self, attempt_id: str):
+        """Disabled-path preparation only; never publishes or retries an attempt."""
+        return self._rebase_attempt_store().request_snapshots(attempt_id)
+
     def list_rebase_attempts(self, branch: str, after=None, limit=100):
         """MO-only bounded inspection; does not create or retry publications."""
         return self._rebase_attempt_store().list_attempts(branch, after, limit)

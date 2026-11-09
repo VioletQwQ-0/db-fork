@@ -48,16 +48,17 @@ class AttemptStoreTest(unittest.TestCase):
         self.assertIn(ATTEMPT, result.candidate_db)
         self.assertLessEqual(len(result.candidate_db), 64)
         statements = [call.args for call in self.cur.execute.call_args_list]
-        self.assertEqual(len(statements), 7)
-        self.assertIn("FOR UPDATE", statements[2][0])
-        self.assertIn("current_account_id()", statements[4][0])
+        self.assertEqual(len(statements), 8)
+        self.assertIn("rebase_snapshot_requests", statements[1][0])
+        self.assertIn("FOR UPDATE", statements[3][0])
         self.assertIn("current_account_id()", statements[5][0])
+        self.assertIn("current_account_id()", statements[6][0])
         self.assertEqual(statements[-1][1][:3], (ATTEMPT, "feature", "PREPARING"))
         self.assertEqual(json.loads(statements[-1][1][3]), asdict(result))
         self.assertFalse(any("SNAPSHOT" in sql[0] or "REBASE" in sql[0]
                              or "DROP" in sql[0] for sql in statements))
         names = [call[0] for call in events.mock_calls]
-        self.assertEqual(names[:3], ["execute", "execute", "begin"])
+        self.assertEqual(names[:4], ["execute", "execute", "execute", "begin"])
         self.assertEqual(names[-2:], ["execute", "commit"])
         self.conn.rollback.assert_not_called()
         self.conn.close.assert_called_once()
@@ -144,24 +145,24 @@ class AttemptStoreTest(unittest.TestCase):
         for rows in ([], [record()], [record("UNKNOWN")]):
             with self.subTest(rows=rows):
                 self.setUp()
-                self.cur.fetchall.side_effect = [rows]
+                self.cur.fetchall.side_effect = [rows, []]
                 outcome = self.store.recover(ATTEMPT)
                 self.assertEqual(outcome["state"], "UNKNOWN")
                 self.assertIsNone(outcome["result"])
-                self.assertEqual(self.cur.execute.call_count, 1)
-                self.assertTrue(self.cur.execute.call_args.args[0].startswith("SELECT"))
+                self.assertEqual(self.cur.execute.call_count, 2 if rows else 1)
+                self.assertTrue(all(call.args[0].startswith("SELECT") for call in self.cur.execute.call_args_list))
                 self.conn.commit.assert_not_called()
                 self.conn.rollback.assert_not_called()
                 self.conn.close.assert_called_once()
 
     def test_committed_result_does_not_depend_on_current_branch_generation(self):
         result = {"candidate_db": "original", "generation": 1}
-        self.cur.fetchall.side_effect = [[record("COMMITTED", result=result)]]
+        self.cur.fetchall.side_effect = [[record("COMMITTED", result=result)], []]
         outcome = self.store.recover(ATTEMPT)
         self.assertEqual(outcome["state"], "COMMITTED")
         self.assertEqual(outcome["result"], result)
-        self.assertNotIn("branches", self.cur.execute.call_args.args[0])
-        self.assertEqual(self.cur.execute.call_count, 1)
+        self.assertTrue(all("branches" not in call.args[0] for call in self.cur.execute.call_args_list))
+        self.assertEqual(self.cur.execute.call_count, 2)
 
     def test_read_failure_is_not_reclassified_as_aborted(self):
         self.cur.execute.side_effect = OSError("server unavailable")

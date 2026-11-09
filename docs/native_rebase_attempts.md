@@ -1,7 +1,8 @@
-# Native Rebase: Durable Intent Stage
+# Native Rebase: Durable Intent And Snapshot Preparation
 
-Status: publication disabled. This stage persists intent and reads committed
-metadata; it is not the complete native Rebase or recovery implementation.
+Status: normal benchmark Rebase is unchanged and native publication is disabled.
+Explicit helpers persist intent, prepare its two snapshots and inspect receipts;
+this is not the complete native Rebase or recovery implementation.
 
 Base adapter: `c2737beaf503dd1f3208efc457d369040f0aca40` (`mo-opt`). The normal
 `_rebase_impl` and generic benchmark API remain unchanged. Kernel R1 and R2
@@ -11,8 +12,8 @@ integration have independent source identities and acceptance requirements.
 
 `RebaseAttemptStore` owns one fresh connection per call. `prepare` commits a
 `PREPARING` row in the existing benchmark metadata database before returning a
-fixed source token, generation and resource names. No snapshot or publication
-is sent by this stage. The source branch row is locked while the intent is
+fixed source token, generation and resource names. `prepare` itself sends no
+snapshot or publication. The source branch row is locked while the intent is
 assembled; source inventory is scoped by account and database ID. Later
 publication must revalidate both the token and registry relation.
 
@@ -22,8 +23,10 @@ exhaustion and generation overflow fail before the intent insert. Failed
 pre-commit preparation rolls back. Once COMMIT is sent, an exception means
 `RebaseAttemptUnknown(attempt_id)`, not a retry, rollback claim or cleanup.
 
-Only benchmark metadata is mutated. The metadata database and its permissions
-remain owned by the benchmark instance, not by an unprivileged external caller.
+Intent preparation mutates only benchmark metadata. The separately invoked
+snapshot stage creates only its two preallocated snapshots. The metadata
+database and its permissions remain owned by the benchmark instance, not by
+an unprivileged external caller.
 No credentials or connection strings are recorded in the intent.
 
 ## Inspection Contract
@@ -33,7 +36,8 @@ No credentials or connection strings are recorded in the intent.
 - `recover_rebase(attempt_id)` uses a new connection and reads only the original
   record. Absent, `PREPARING` or `UNKNOWN` records return `UNKNOWN`. A stored
   `COMMITTED` result is returned without consulting the current branch pointer,
-  which may already have moved again. Read errors propagate.
+   which may already have moved again. Inspection also reads at most two
+   snapshot receipts; read errors propagate.
 - Corrupt identity, generation, state or result data is rejected. Neither
   inspection method publishes, retries, aborts, drops or reclaims anything.
 
@@ -77,3 +81,45 @@ commit uncertainty, connection cleanup and read-only inspection. They do not
 prove transaction conflicts, WAL recovery or actual adapter process death.
 Those real-database and real-process acceptance gates remain `NOT_RUN` for
 this module. Performance is not measured at this stage.
+
+## Snapshot Request Owner
+
+The next isolated stage adds at most two request rows per attempt in the same
+benchmark metadata database, keyed by `(attempt_id, role)`. This keeps the
+immutable intent and terminal publication result separate from independently
+committed snapshot receipts without an ALTER of already-created attempt rows.
+Only `feature` and `upstream` roles are accepted. Their names and database IDs
+come from the committed intent; no retry generates a new resource name.
+
+Before sending CREATE SNAPSHOT, a fresh metadata transaction locks the branch
+registration row and then the original attempt row, checks its generation and
+database identity, and inserts `REQUESTED`. It commits before opening the
+autocommit snapshot-request connection. A failed/unknown reservation commit
+sends no snapshot request. A pre-existing REQUESTED row is UNKNOWN and must not
+be reissued; a valid CONFIRMED row may be reused without another CREATE.
+Upstream preparation requires a confirmed feature receipt.
+
+After a successful snapshot response, query its UUID, timestamp and database ID
+from the current account's snapshot catalog. Verify level/name/ID against the
+intent and persist a CONFIRMED receipt under the same branch-before-attempt
+lock order. Receipt confirmation does not publish a branch and therefore does
+not require the current branch generation to remain unchanged; the later
+publication transaction must still validate it. Any failure after REQUESTED
+was committed conservatively retains the record and resources. In particular,
+client death before send is indistinguishable on restart from an in-flight
+request; catalog absence is not proof of rollback.
+
+Inspection may return the two bounded receipts but still reports UNKNOWN for
+an unpublished attempt, even when both snapshots are confirmed. No ABORTED,
+snapshot deletion, retry scheduler or publication is introduced. The normal
+benchmark Rebase stays unchanged. The component and its offline ordering/error
+tests may be developed independently; real request and adapter-process exits
+remain required before R2 acceptance. This owner design is accepted for the
+disabled adapter stage, not evidence of runtime correctness.
+
+The focused offline suite contains 34 tests, including the original 18 intent
+cases. It verifies acknowledged reservation before request, branch/attempt lock
+order, two independent autocommit requests, confirmed receipt reuse, commit
+uncertainty, stale generations, receipt corruption and connection release.
+All pass locally; real snapshot execution, competing publication and actual
+adapter subprocess exits remain NOT_RUN. No result is a performance sample.

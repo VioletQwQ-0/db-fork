@@ -1,11 +1,11 @@
-"""Durable intent and read-only reconciliation for native MO Rebase.
+"""Durable intent, snapshot receipts and reconciliation for native MO Rebase.
 
-This module does not invoke Rebase, send snapshot requests, retire databases or
-delete resources. Publication integration remains disabled until kernel and
-real-process acceptance pass. Pending intent is never proof of rollback.
+The optional snapshot stage does not publish, retire or delete anything. Normal
+benchmark Rebase is unchanged. Publication integration remains disabled until
+kernel and real-process acceptance pass; pending intent is not rollback proof.
 """
 
-from contextlib import closing
+from contextlib import closing, contextmanager
 from dataclasses import asdict, dataclass
 import hashlib
 import json
@@ -23,10 +23,23 @@ CREATE TABLE IF NOT EXISTS {table} (
     result_json TEXT
 )
 """
+REQUESTS_TABLE = "rebase_snapshot_requests"
+REQUESTS_DDL = """
+CREATE TABLE IF NOT EXISTS {table} (
+    attempt_id VARCHAR(32) NOT NULL,
+    role VARCHAR(8) NOT NULL,
+    state VARCHAR(16) NOT NULL,
+    snapshot_name VARCHAR(64) NOT NULL,
+    database_id BIGINT UNSIGNED NOT NULL,
+    snapshot_uuid VARCHAR(36),
+    snapshot_ts BIGINT UNSIGNED,
+    PRIMARY KEY (attempt_id, role)
+)
+"""
 
 
 class RebaseAttemptUnknown(RuntimeError):
-    """An intent COMMIT may have succeeded; inspect this ID, never reissue it."""
+    """A request or COMMIT may have succeeded; inspect this ID, never reissue it."""
 
     def __init__(self, attempt_id):
         self.attempt_id = attempt_id
@@ -90,6 +103,35 @@ class RebaseAttemptStore:
         quoted = _identifier(meta_db)
         self._attempts = f"{quoted}.`{ATTEMPTS_TABLE}`"
         self._branches = f"{quoted}.`branches`"
+        self._requests = f"{quoted}.`{REQUESTS_TABLE}`"
+
+    @contextmanager
+    def _transaction(self, attempt_id, initialize=False):
+        with closing(self._connect()) as conn:
+            if not conn.get_autocommit():
+                raise ValueError("Rebase metadata requires a fresh autocommit connection")
+            with conn.cursor() as cur:
+                if initialize:
+                    cur.execute(ATTEMPTS_DDL.format(table=self._attempts))
+                    cur.execute(REQUESTS_DDL.format(table=self._requests))
+                cur.execute("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            conn.begin()
+            commit_started = False
+            try:
+                with conn.cursor() as cur:
+                    yield cur
+                commit_started = True
+                try:
+                    conn.commit()
+                except Exception as exc:
+                    raise RebaseAttemptUnknown(attempt_id) from exc
+            except BaseException:
+                if not commit_started:
+                    try:
+                        conn.rollback()
+                    except Exception as exc:
+                        raise RebaseAttemptUnknown(attempt_id) from exc
+                raise
 
     def prepare(self, branch, upstream_branch, attempt_id=None):
         """Persist fixed token and resource names before any snapshot request.
@@ -100,64 +142,166 @@ class RebaseAttemptStore:
         _identifier(branch)
         _identifier(upstream_branch)
         attempt_id = _attempt_id(attempt_id if attempt_id is not None else uuid.uuid4().hex)
-        with closing(self._connect()) as conn:
-            if not conn.get_autocommit():
-                raise ValueError("intent preparation requires a fresh autocommit connection")
-            with conn.cursor() as cur:
-                cur.execute(ATTEMPTS_DDL.format(table=self._attempts))
-                cur.execute("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
-            conn.begin()
-            commit_started = False
+        with self._transaction(attempt_id, initialize=True) as cur:
+            cur.execute(f"SELECT db, gen FROM {self._branches} WHERE name=%s FOR UPDATE", (branch,))
+            source = cur.fetchone()
+            if source is None:
+                raise ValueError("unknown source branch")
+            cur.execute(f"SELECT db, gen FROM {self._branches} WHERE name=%s", (upstream_branch,))
+            upstream = cur.fetchone()
+            if upstream is None or source[0] == upstream[0]:
+                raise ValueError("unknown upstream or identical branch")
+            cur.execute("SELECT d.dat_id, i.epoch FROM mo_catalog.mo_database d "
+                        "JOIN mo_catalog.mo_database_inventory i "
+                        "ON i.account_id=d.account_id AND i.database_id=d.dat_id "
+                        "WHERE d.account_id=current_account_id() AND d.datname=%s", (source[0],))
+            rows = cur.fetchall()
+            if len(rows) != 1:
+                raise ValueError("missing or ambiguous source inventory")
+            source_id, epoch = rows[0]
+            cur.execute("SELECT dat_id FROM mo_catalog.mo_database "
+                        "WHERE account_id=current_account_id() AND datname=%s", (upstream[0],))
+            rows = cur.fetchall()
+            if len(rows) != 1:
+                raise ValueError("missing or ambiguous upstream identity")
+            gen = int(source[1])
+            prefix = hashlib.sha256((self._attempts + "\x00" + branch).encode()).hexdigest()[:12]
+            intent = RebaseIntent(
+                attempt_id, branch, source[0], int(source_id), int(epoch), gen,
+                f"bb_r2_{prefix}_{gen + 1}_{attempt_id}", gen + 1,
+                upstream[0], int(rows[0][0]), f"bb_r2_f_{attempt_id}", f"bb_r2_u_{attempt_id}")
+            cur.execute(f"INSERT INTO {self._attempts} (attempt_id,branch,state,intent_json) "
+                        "VALUES (%s,%s,%s,%s)",
+                        (attempt_id, branch, "PREPARING", json.dumps(asdict(intent), sort_keys=True)))
+            if cur.rowcount != 1:
+                raise RuntimeError("Rebase intent was not inserted exactly once")
+        return intent
+
+    @staticmethod
+    def _snapshot_spec(intent, role):
+        if role == "feature":
+            return intent.feature_snapshot, intent.source_db, intent.source_id
+        if role == "upstream":
+            return intent.upstream_snapshot, intent.upstream_db, intent.upstream_id
+        raise ValueError("invalid Rebase snapshot role")
+
+    def _locked_intent(self, cur, intent, require_current):
+        # Every writer observes branch -> attempt order. Confirmation only
+        # records a completed request; it never publishes a stale generation.
+        cur.execute(f"SELECT db, gen FROM {self._branches} WHERE name=%s FOR UPDATE", (intent.branch,))
+        branch = cur.fetchone()
+        cur.execute(f"SELECT attempt_id,state,intent_json,result_json FROM {self._attempts} "
+                    "WHERE attempt_id=%s FOR UPDATE", (intent.attempt_id,))
+        rows = cur.fetchall()
+        if len(rows) != 1:
+            raise RebaseAttemptUnknown(intent.attempt_id)
+        record = self._decode(rows[0])
+        if record["intent"] != asdict(intent) or record["state"] != "PREPARING":
+            raise ValueError("Rebase intent is changed or no longer preparing")
+        if require_current and branch != (intent.source_db, intent.old_generation):
+            raise ValueError("Rebase source registration changed before snapshot request")
+
+    def _read_snapshot_requests(self, cur, intent, role=None):
+        predicate = "attempt_id=%s" + (" AND role=%s" if role else "")
+        params = (intent.attempt_id, role) if role else (intent.attempt_id,)
+        cur.execute(f"SELECT role,state,snapshot_name,database_id,snapshot_uuid,snapshot_ts "
+                    f"FROM {self._requests} WHERE {predicate} ORDER BY role LIMIT 3", params)
+        rows = cur.fetchall()
+        receipts = [self._decode_snapshot_request(intent, row) for row in rows]
+        roles = [receipt["role"] for receipt in receipts]
+        if len(roles) != len(set(roles)) or len(roles) > 2 or (role and roles not in ([], [role])):
+            raise ValueError("ambiguous Rebase snapshot receipts")
+        return receipts
+
+    @classmethod
+    def _decode_snapshot_request(cls, intent, row):
+        role, state, name, database_id, snapshot_id, ts = row
+        expected_name, _, expected_id = cls._snapshot_spec(intent, role)
+        if name != expected_name or type(database_id) is not int or database_id != expected_id:
+            raise ValueError("snapshot receipt belongs to a different resource")
+        if state == "CONFIRMED":
+            if (not isinstance(snapshot_id, str) or str(uuid.UUID(snapshot_id)) != snapshot_id
+                    or type(ts) is not int or not 0 < ts < 2 ** 63):
+                raise ValueError("invalid confirmed snapshot identity")
+        elif state != "REQUESTED" or snapshot_id is not None or ts is not None:
+            raise ValueError("invalid snapshot request state")
+        return {"role": role, "state": state, "snapshot_name": name,
+                "database_id": database_id, "snapshot_uuid": snapshot_id, "snapshot_ts": ts}
+
+    def _reserve_snapshot_request(self, intent, role):
+        name, _, database_id = self._snapshot_spec(intent, role)
+        with self._transaction(intent.attempt_id) as cur:
+            self._locked_intent(cur, intent, require_current=True)
+            receipts = self._read_snapshot_requests(cur, intent, role)
+            if receipts:
+                if receipts[0]["state"] == "REQUESTED":
+                    raise RebaseAttemptUnknown(intent.attempt_id)
+                return receipts[0]
+            if role == "upstream":
+                feature = self._read_snapshot_requests(cur, intent, "feature")
+                if not feature or feature[0]["state"] != "CONFIRMED":
+                    raise RebaseAttemptUnknown(intent.attempt_id)
+            cur.execute(f"INSERT INTO {self._requests} "
+                        "(attempt_id,role,state,snapshot_name,database_id) VALUES (%s,%s,%s,%s,%s)",
+                        (intent.attempt_id, role, "REQUESTED", name, database_id))
+            if cur.rowcount != 1:
+                raise RuntimeError("snapshot request was not inserted exactly once")
+        return None
+
+    def _confirm_snapshot_request(self, intent, receipt):
+        with self._transaction(intent.attempt_id) as cur:
+            self._locked_intent(cur, intent, require_current=False)
+            existing = self._read_snapshot_requests(cur, intent, receipt["role"])
+            if not existing:
+                raise RebaseAttemptUnknown(intent.attempt_id)
+            if existing[0]["state"] == "CONFIRMED":
+                if existing[0] != receipt:
+                    raise ValueError("confirmed snapshot identity changed")
+                return
+            cur.execute(f"UPDATE {self._requests} SET state=%s,snapshot_uuid=%s,snapshot_ts=%s "
+                        "WHERE attempt_id=%s AND role=%s AND state=%s", (
+                            "CONFIRMED", receipt["snapshot_uuid"], receipt["snapshot_ts"],
+                            intent.attempt_id, receipt["role"], "REQUESTED"))
+            if cur.rowcount != 1:
+                raise RebaseAttemptUnknown(intent.attempt_id)
+
+    def request_snapshots(self, attempt_id):
+        """Prepare the original two resources, without publishing or reissuing."""
+        outcome = self.recover(attempt_id)
+        if "intent" not in outcome:
+            raise RebaseAttemptUnknown(attempt_id)
+        if outcome["state"] != "UNKNOWN":
+            raise ValueError("terminal Rebase attempt cannot prepare new snapshots")
+        intent = RebaseIntent(**outcome["intent"])
+        receipts = []
+        for role in ("feature", "upstream"):
+            existing = self._reserve_snapshot_request(intent, role)
+            if existing is not None:
+                receipts.append(existing)
+                continue
+            name, database, database_id = self._snapshot_spec(intent, role)
             try:
-                with conn.cursor() as cur:
-                    # Preparing only locks the branch row; no attempt lock is
-                    # acquired and then followed by a branch lock.
-                    cur.execute(f"SELECT db, gen FROM {self._branches} WHERE name=%s FOR UPDATE", (branch,))
-                    source = cur.fetchone()
-                    if source is None:
-                        raise ValueError("unknown source branch")
-                    cur.execute(f"SELECT db, gen FROM {self._branches} WHERE name=%s", (upstream_branch,))
-                    upstream = cur.fetchone()
-                    if upstream is None or source[0] == upstream[0]:
-                        raise ValueError("unknown upstream or identical branch")
-                    # Tenant scope is explicit even for a system-account client.
-                    cur.execute("SELECT d.dat_id, i.epoch FROM mo_catalog.mo_database d "
-                                "JOIN mo_catalog.mo_database_inventory i "
-                                "ON i.account_id=d.account_id AND i.database_id=d.dat_id "
-                                "WHERE d.account_id=current_account_id() AND d.datname=%s", (source[0],))
-                    rows = cur.fetchall()
-                    if len(rows) != 1:
-                        raise ValueError("missing or ambiguous source inventory")
-                    source_id, epoch = rows[0]
-                    cur.execute("SELECT dat_id FROM mo_catalog.mo_database "
-                                "WHERE account_id=current_account_id() AND datname=%s", (upstream[0],))
-                    rows = cur.fetchall()
-                    if len(rows) != 1:
-                        raise ValueError("missing or ambiguous upstream identity")
-                    gen = int(source[1])
-                    prefix = hashlib.sha256((self._attempts + "\x00" + branch).encode()).hexdigest()[:12]
-                    intent = RebaseIntent(
-                        attempt_id, branch, source[0], int(source_id), int(epoch), gen,
-                        f"bb_r2_{prefix}_{gen + 1}_{attempt_id}", gen + 1,
-                        upstream[0], int(rows[0][0]), f"bb_r2_f_{attempt_id}", f"bb_r2_u_{attempt_id}")
-                    cur.execute(f"INSERT INTO {self._attempts} (attempt_id,branch,state,intent_json) "
-                                "VALUES (%s,%s,%s,%s)",
-                                (attempt_id, branch, "PREPARING", json.dumps(asdict(intent), sort_keys=True)))
-                    if cur.rowcount != 1:
-                        raise RuntimeError("Rebase intent was not inserted exactly once")
-                commit_started = True
-                try:
-                    conn.commit()
-                except Exception as exc:
-                    raise RebaseAttemptUnknown(attempt_id) from exc
-                return intent
-            except BaseException:
-                if not commit_started:
-                    try:
-                        conn.rollback()
-                    except Exception as exc:
-                        raise RebaseAttemptUnknown(attempt_id) from exc
-                raise
+                with closing(self._connect()) as conn:
+                    if not conn.get_autocommit():
+                        raise ValueError("snapshot request requires a fresh autocommit connection")
+                    with conn.cursor() as cur:
+                        cur.execute(f"CREATE SNAPSHOT {_identifier(name)} FOR DATABASE {_identifier(database)}")
+                        cur.execute("SELECT cast(snapshot_id as char(36)),ts,level,database_name,obj_id "
+                                    "FROM mo_catalog.mo_snapshots "
+                                    "WHERE sname=%s AND account_name=current_account_name()", (name,))
+                        rows = cur.fetchall()
+                    if len(rows) != 1 or rows[0][2:4] != ("database", database):
+                        raise ValueError("missing or mismatched snapshot identity")
+                    snapshot_id, ts, _, _, actual_id = rows[0]
+                    receipt = self._decode_snapshot_request(intent, (
+                        role, "CONFIRMED", name, actual_id, snapshot_id, ts))
+                    if actual_id != database_id:
+                        raise ValueError("snapshot database identity changed")
+                self._confirm_snapshot_request(intent, receipt)
+                receipts.append(receipt)
+            except Exception as exc:
+                raise RebaseAttemptUnknown(attempt_id) from exc
+        return {"attempt_id": attempt_id, "state": "UNKNOWN", "snapshots": receipts}
 
     def list_attempts(self, branch, after=None, limit=100):
         """Return a bounded page, including its explicit continuation cursor."""
@@ -189,11 +333,12 @@ class RebaseAttemptStore:
             cur.execute(f"SELECT attempt_id,state,intent_json,result_json FROM {self._attempts} "
                         "WHERE attempt_id=%s", (attempt_id,))
             rows = cur.fetchall()
-        if not rows:
-            return {"attempt_id": attempt_id, "state": "UNKNOWN", "result": None}
-        if len(rows) != 1:
-            raise ValueError("ambiguous Rebase attempt identity")
-        outcome = self._decode(rows[0])
+            if not rows:
+                return {"attempt_id": attempt_id, "state": "UNKNOWN", "result": None}
+            if len(rows) != 1:
+                raise ValueError("ambiguous Rebase attempt identity")
+            outcome = self._decode(rows[0])
+            outcome["snapshots"] = self._read_snapshot_requests(cur, RebaseIntent(**outcome["intent"]))
         if outcome["state"] not in ("COMMITTED", "ABORTED"):
             outcome["state"] = "UNKNOWN"
         return outcome
