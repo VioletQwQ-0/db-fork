@@ -1,6 +1,6 @@
 """Metadata correctness and round-trip bounds without a running MO server."""
 
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pymysql
 import pytest
@@ -57,6 +57,16 @@ def test_native_intent_rejects_unrecorded_common_base_without_snapshot_or_prepar
     with pytest.raises(UnsupportedOperation, match="recorded common base"):
         s._prepare_native_rebase_attempt(Ref("feature"), Ref("main"))
     s._rebase_attempt_store.assert_not_called()
+
+
+def test_native_recovery_delegates_only_to_original_attempt():
+    s = suite()
+    store = Mock()
+    s._rebase_attempt_store = Mock(return_value=store)
+    attempt_id = "0123456789abcdef0123456789abcdef"
+    assert s.recover_rebase(attempt_id) == store.recover.return_value
+    store.recover.assert_called_once_with(attempt_id)
+    assert store.method_calls == [call.recover(attempt_id)]
 
 
 @pytest.mark.parametrize("source,upstream", [(None, ("bench", 0)),

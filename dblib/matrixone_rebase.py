@@ -12,6 +12,8 @@ import json
 import re
 import uuid
 
+from pymysql.err import OperationalError
+
 
 ATTEMPTS_TABLE = "rebase_attempts"
 ATTEMPTS_DDL = """
@@ -332,7 +334,7 @@ class RebaseAttemptStore:
 
     def request_snapshots(self, attempt_id):
         """Prepare the original two resources, without publishing or reissuing."""
-        outcome = self.recover(attempt_id)
+        outcome = self._inspect(attempt_id)
         if "intent" not in outcome:
             raise RebaseAttemptUnknown(attempt_id)
         if outcome["state"] != "UNKNOWN":
@@ -386,13 +388,8 @@ class RebaseAttemptStore:
             raise ValueError("persisted attempt belongs to a different branch")
         return {"attempts": page, "next": page[-1]["attempt_id"] if len(rows) > limit else None}
 
-    def recover(self, attempt_id):
-        """Read committed terminal evidence without publishing or cleaning.
-
-        Pending/absent rows remain UNKNOWN. Determining ABORTED for an active
-        or rolled-back publisher needs the later locked terminal protocol and
-        snapshot request receipts; this read-only stage never guesses it.
-        """
+    def _inspect(self, attempt_id):
+        """Read identities for preparation/recovery; never infer rollback."""
         _attempt_id(attempt_id)
         with closing(self._connect()) as conn, conn.cursor() as cur:
             cur.execute(f"SELECT attempt_id,state,intent_json,result_json FROM {self._attempts} "
@@ -407,6 +404,55 @@ class RebaseAttemptStore:
         if outcome["state"] not in ("COMMITTED", "ABORTED"):
             outcome["state"] = "UNKNOWN"
         return outcome
+
+    def recover(self, attempt_id):
+        """Confirm the original attempt under the publisher's lock order.
+
+        The first read only discovers its immutable branch identity. A current
+        branch pointer is not proof of an earlier attempt's success or failure.
+        No pending record is aborted and no request or publication is reissued.
+        """
+        observed = self._inspect(attempt_id)
+        if "intent" not in observed:
+            return observed
+        intent = RebaseIntent(**observed["intent"])
+        unknown = {"attempt_id": attempt_id, "state": "UNKNOWN", "result": None,
+                   "intent": asdict(intent)}
+        try:
+            with self._transaction(attempt_id) as cur:
+                cur.execute(f"SELECT name FROM {self._branches} WHERE name=%s FOR UPDATE NOWAIT",
+                            (intent.branch,))
+                # A terminal attempt remains valid after its branch advances or
+                # is removed. Only the original durable result is authoritative.
+                registrations = cur.fetchall()
+                if registrations not in ([], [(intent.branch,)]):
+                    raise ValueError("ambiguous Rebase branch registration")
+                cur.execute(f"SELECT attempt_id,state,intent_json,result_json FROM {self._attempts} "
+                            "WHERE attempt_id=%s FOR UPDATE NOWAIT", (attempt_id,))
+                rows = cur.fetchall()
+                if not rows:
+                    return unknown
+                if len(rows) != 1:
+                    raise ValueError("ambiguous Rebase attempt identity")
+                outcome = self._decode(rows[0])
+                if outcome["intent"] != observed["intent"]:
+                    raise ValueError("Rebase intent changed during recovery")
+                if (observed["state"] in ("COMMITTED", "ABORTED")
+                        and (outcome["state"], outcome["result"])
+                        != (observed["state"], observed["result"])):
+                    raise ValueError("Rebase terminal evidence changed during recovery")
+                outcome["snapshots"] = self._read_snapshot_requests(cur, intent)
+                if outcome["state"] not in ("COMMITTED", "ABORTED"):
+                    outcome["state"] = "UNKNOWN"
+            return outcome
+        except RebaseAttemptUnknown:
+            return unknown
+        except OperationalError as exc:
+            # MySQL lock-wait/deadlock errors prove neither publisher rollback
+            # nor snapshot termination. Other read/server failures stay errors.
+            if exc.args and exc.args[0] in (1205, 1213, 3572):
+                return unknown
+            raise
 
     @staticmethod
     def _decode(row):

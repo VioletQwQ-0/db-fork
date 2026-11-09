@@ -237,6 +237,8 @@ class SnapshotRequestTest(unittest.TestCase):
 
     def test_pending_confirmed_receipts_do_not_imply_publication(self):
         self.add_inspection([receipt(confirmed=True), receipt("upstream", True)])
+        self.add_connection([[("feature",)], [record()],
+                             [receipt(confirmed=True), receipt("upstream", True)]])
         outcome = self.store.recover(ATTEMPT)
         self.assertEqual(outcome["state"], "UNKNOWN")
         self.assertIsNone(outcome["result"])

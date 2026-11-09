@@ -495,7 +495,7 @@ class MatrixOneToolSuite(DBToolSuite):
         return self._rebase_attempt_store().list_attempts(branch, after, limit)
 
     def recover_rebase(self, attempt_id: str):
-        """Read an original attempt; pending outcomes retain their resources."""
+        """Confirm an original attempt under locks; UNKNOWN retains resources."""
         return self._rebase_attempt_store().recover(attempt_id)
 
     def _registry_row(self, branch: str):

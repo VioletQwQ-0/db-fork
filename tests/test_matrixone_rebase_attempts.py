@@ -169,7 +169,7 @@ class AttemptStoreTest(unittest.TestCase):
             with self.subTest(rows=rows):
                 self.setUp()
                 self.cur.fetchall.side_effect = [rows, []]
-                outcome = self.store.recover(ATTEMPT)
+                outcome = self.store._inspect(ATTEMPT)
                 self.assertEqual(outcome["state"], "UNKNOWN")
                 self.assertIsNone(outcome["result"])
                 self.assertEqual(self.cur.execute.call_count, 2 if rows else 1)
@@ -181,7 +181,7 @@ class AttemptStoreTest(unittest.TestCase):
     def test_committed_result_does_not_depend_on_current_branch_generation(self):
         result = {"candidate_db": "original", "generation": 1}
         self.cur.fetchall.side_effect = [[record("COMMITTED", result=result)], []]
-        outcome = self.store.recover(ATTEMPT)
+        outcome = self.store._inspect(ATTEMPT)
         self.assertEqual(outcome["state"], "COMMITTED")
         self.assertEqual(outcome["result"], result)
         self.assertTrue(all("branches" not in call.args[0] for call in self.cur.execute.call_args_list))
@@ -248,7 +248,7 @@ class AttemptStoreTest(unittest.TestCase):
     def test_preparing_intent_keeps_both_original_bases_after_branch_moves(self):
         value = intent()
         self.cur.fetchall.side_effect = [[record(value=value)], []]
-        outcome = self.store.recover(ATTEMPT)
+        outcome = self.store._inspect(ATTEMPT)
         self.assertEqual(outcome["state"], "UNKNOWN")
         self.assertEqual(outcome["intent"]["feature_base"], asdict(value.feature_base))
         self.assertEqual(outcome["intent"]["upstream_base"], asdict(value.upstream_base))

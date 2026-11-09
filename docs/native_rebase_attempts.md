@@ -47,17 +47,24 @@ No credentials or connection strings are recorded in the intent.
 
 - `list_rebase_attempts(branch, after=None, limit=100)` returns at most 100 rows
   with an explicit ID-ordered continuation cursor. It does not create tables.
-- `recover_rebase(attempt_id)` uses a new connection and reads only the original
-  record. Absent, `PREPARING` or `UNKNOWN` records return `UNKNOWN`. A stored
-  `COMMITTED` result is returned without consulting the current branch pointer,
-   which may already have moved again. Inspection also reads at most two
-   snapshot receipts; read errors propagate.
+- `recover_rebase(attempt_id)` first reads the immutable intent, then uses a
+  fresh RC transaction to lock the branch registration before the attempt row
+  and reread the original result and its at most two snapshot receipts. Both
+  locking reads use NOWAIT: a busy publisher returns `UNKNOWN`, not a stalled
+  recovery operation or rollback inference. Lock-wait timeout, deadlock and
+  uncertain recovery-transaction completion also remain `UNKNOWN`; other
+  read errors propagate. Absent, `PREPARING` or `UNKNOWN` records return
+  `UNKNOWN`. A stored `COMMITTED` result survives an advanced or removed
+  current branch registration; recovery never derives its outcome from the
+  current pointer. Changed immutable identity or terminal evidence is rejected.
 - Corrupt identity, generation, state or result data is rejected. Neither
   inspection method publishes, retries, aborts, drops or reclaims anything.
 
-This deliberately incomplete read-only reconciliation cannot establish that a
-publisher or snapshot request has ended. It cannot transition a pending row to
-`ABORTED` or authorize resource deletion.
+Locked confirmation still cannot establish that an independent snapshot request
+has ended. It cannot transition a pending row to `ABORTED` or authorize resource
+deletion. The preparation stage uses non-locking inspection only to discover the
+intent before its separate branch/attempt-locked request admission; this is not
+a second recovery or publishing API.
 
 ## Required Publication Integration
 
@@ -70,10 +77,10 @@ Before enabling native Rebase, implement and validate all of the following:
    before the attempt row. Validate generation, database identity and fixed
    inventory token. Commit epoch reservation, replayed candidate, new base,
    history, pointer CAS, source retirement and `COMMITTED` result together.
-3. Locked recovery confirms the same attempt without replay. It may mark
-   `ABORTED` only after publication rollback and all independent snapshot
-   requests have confirmed terminal states. It must not infer rollback from
-   missing metadata, a disconnected client or a lock timeout.
+3. The locked confirmation path must pass real-client competition and process
+   recovery tests. An eventual transition to `ABORTED` requires publication
+   rollback and all independent snapshot requests to have confirmed terminal
+   states. Missing metadata, disconnect or lock timeout is not such evidence.
 4. Keep old generations and snapshots until historical and active references
    prove reclamation safe. No sweeper or unbounded automatic retry is added.
 
@@ -95,6 +102,14 @@ commit uncertainty, connection cleanup and read-only inspection. They do not
 prove transaction conflicts, WAL recovery or actual adapter process death.
 Those real-database and real-process acceptance gates remain `NOT_RUN` for
 this module. Performance is not measured at this stage.
+
+The locked-recovery tests additionally cover branch-before-attempt NOWAIT,
+pending-to-committed rereads, missing/advanced registration, both busy lock
+positions, release uncertainty, immutable-identity/terminal-result corruption,
+and retained pending resources. These are offline owner/ordering oracles, not
+proof that two actual database transactions conflict or that a killed client
+recovers safely. No ABORTED writer, publication or resource reclamation is
+enabled by this slice.
 
 ## Snapshot Request Owner
 
