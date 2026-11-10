@@ -40,6 +40,7 @@ class SnapshotRequestTest(unittest.TestCase):
         cur.execute.side_effect = lambda query, params=None: self.events.append((index, "execute", query, params))
         conn.begin.side_effect = lambda: self.events.append((index, "begin"))
         conn.commit.side_effect = lambda: self.events.append((index, "commit"))
+        conn.rollback.side_effect = lambda: self.events.append((index, "rollback"))
         self.connections.append(conn)
         self.cursors.append(cur)
         return conn, cur

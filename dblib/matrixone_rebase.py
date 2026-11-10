@@ -218,7 +218,7 @@ class RebaseAttemptStore:
         return branches
 
     @contextmanager
-    def _transaction(self, attempt_id, initialize=False):
+    def _transaction(self, attempt_id, initialize=False, rolled_back=None):
         with closing(self._connect()) as conn:
             if not conn.get_autocommit():
                 raise ValueError("Rebase metadata requires a fresh autocommit connection")
@@ -241,6 +241,8 @@ class RebaseAttemptStore:
                 if not commit_started:
                     try:
                         conn.rollback()
+                        if rolled_back is not None:
+                            rolled_back.append(True)
                     except Exception as exc:
                         raise RebaseAttemptUnknown(attempt_id) from exc
                 raise
@@ -290,6 +292,14 @@ class RebaseAttemptStore:
                 raise ValueError("unknown source branch")
             if source != source_registration:
                 raise ValueError("Rebase source generation changed during base resolution")
+            cur.execute(f"SELECT attempt_id FROM {self._attempts} WHERE branch=%s "
+                        "AND state IN (%s,%s,%s) ORDER BY attempt_id LIMIT 1",
+                        (branch, "PREPARING", "PUBLISHING", "UNKNOWN"))
+            pending = cur.fetchall()
+            if pending:
+                if len(pending) != 1 or len(pending[0]) != 1:
+                    raise ValueError("ambiguous pending Rebase attempt")
+                raise RebaseAttemptUnknown(_attempt_id(pending[0][0]))
             cur.execute(f"SELECT db, gen FROM {self._branches} WHERE name=%s", (upstream_branch,))
             upstream = cur.fetchone()
             if upstream is None or source[0] == upstream[0]:
@@ -331,7 +341,7 @@ class RebaseAttemptStore:
             return intent.upstream_snapshot, intent.upstream_db, intent.upstream_id
         raise ValueError("invalid Rebase snapshot role")
 
-    def _locked_intent(self, cur, intent, require_current):
+    def _locked_intent(self, cur, intent, require_current, expected_state="PREPARING"):
         # Every writer observes branch -> attempt order. Confirmation only
         # records a completed request; it never publishes a stale generation.
         cur.execute(f"SELECT db, gen FROM {self._branches} WHERE name=%s FOR UPDATE", (intent.branch,))
@@ -342,7 +352,11 @@ class RebaseAttemptStore:
         if len(rows) != 1:
             raise RebaseAttemptUnknown(intent.attempt_id)
         record = self._decode(rows[0])
-        if record["intent"] != asdict(intent) or record["state"] != "PREPARING":
+        if record["intent"] != asdict(intent):
+            raise ValueError("Rebase intent identity changed")
+        if record["state"] in ("PUBLISHING", "UNKNOWN") and record["state"] != expected_state:
+            raise RebaseAttemptUnknown(intent.attempt_id)
+        if record["state"] != expected_state:
             raise ValueError("Rebase intent is changed or no longer preparing")
         if require_current and branch != (intent.source_db, intent.old_generation):
             raise ValueError("Rebase source registration changed before snapshot request")
@@ -482,8 +496,52 @@ class RebaseAttemptStore:
         intent = RebaseIntent(**observed["intent"])
         if intent.candidate_db != self._candidate_database(intent.branch, intent.new_generation, attempt_id):
             raise ValueError("Rebase candidate does not match its allocated identity")
-        with self._transaction(attempt_id) as cur:
+        self._reserve_publication(intent)
+        rolled_back = []
+        try:
+            return self._publish_reserved(intent, rolled_back)
+        except RebaseAttemptUnknown:
+            raise
+        except Exception as exc:
+            if not rolled_back:
+                raise RebaseAttemptUnknown(attempt_id) from exc
+            try:
+                self._abort_rolled_back_publication(intent, type(exc).__name__)
+            except Exception as abort_error:
+                raise RebaseAttemptUnknown(attempt_id) from abort_error
+            raise
+
+    def _reserve_publication(self, intent):
+        with self._transaction(intent.attempt_id) as cur:
             self._locked_intent(cur, intent, require_current=True)
+            receipts = self._read_snapshot_requests(cur, intent)
+            if (len(receipts) != 2 or {r["role"] for r in receipts} != {"feature", "upstream"}
+                    or any(r["state"] != "CONFIRMED" for r in receipts)):
+                raise RebaseAttemptUnknown(intent.attempt_id)
+            cur.execute(f"UPDATE {self._attempts} SET state=%s WHERE attempt_id=%s AND state=%s",
+                        ("PUBLISHING", intent.attempt_id, "PREPARING"))
+            if cur.rowcount != 1:
+                raise RebaseAttemptUnknown(intent.attempt_id)
+
+    def _abort_rolled_back_publication(self, intent, error_type):
+        # Only the original publisher calls this after its rollback response.
+        # Inspection/recovery has no such evidence and must never call it.
+        with self._transaction(intent.attempt_id) as cur:
+            self._locked_intent(cur, intent, require_current=False, expected_state="PUBLISHING")
+            receipts = self._read_snapshot_requests(cur, intent)
+            if len(receipts) != 2 or any(r["state"] != "CONFIRMED" for r in receipts):
+                raise RebaseAttemptUnknown(intent.attempt_id)
+            cur.execute(f"UPDATE {self._attempts} SET state=%s,result_json=%s "
+                        "WHERE attempt_id=%s AND state=%s",
+                        ("ABORTED", json.dumps({"error_type": error_type}, sort_keys=True),
+                         intent.attempt_id, "PUBLISHING"))
+            if cur.rowcount != 1:
+                raise RebaseAttemptUnknown(intent.attempt_id)
+
+    def _publish_reserved(self, intent, rolled_back):
+        attempt_id = intent.attempt_id
+        with self._transaction(attempt_id, rolled_back=rolled_back) as cur:
+            self._locked_intent(cur, intent, require_current=True, expected_state="PUBLISHING")
             receipts = self._read_snapshot_requests(cur, intent)
             upstream = self._check_publication_snapshots(cur, intent, receipts)
             cur.execute("SELECT dat_id FROM mo_catalog.mo_database "
@@ -578,7 +636,7 @@ class RebaseAttemptStore:
                       "native_sql_elapsed_sec": native_elapsed}
             cur.execute(f"UPDATE {self._attempts} SET state=%s,result_json=%s "
                         "WHERE attempt_id=%s AND state=%s", (
-                            "COMMITTED", json.dumps(result, sort_keys=True), attempt_id, "PREPARING"))
+                            "COMMITTED", json.dumps(result, sort_keys=True), attempt_id, "PUBLISHING"))
             if cur.rowcount != 1:
                 raise ValueError("Rebase success record changed during publication")
         return result
@@ -674,7 +732,7 @@ class RebaseAttemptStore:
             intent = RebaseIntent(**json.loads(raw_intent))
         except (TypeError, ValueError) as exc:
             raise ValueError("invalid persisted Rebase intent; fixed bases are required") from exc
-        if attempt_id != intent.attempt_id or state not in ("PREPARING", "UNKNOWN", "COMMITTED", "ABORTED"):
+        if attempt_id != intent.attempt_id or state not in ("PREPARING", "PUBLISHING", "UNKNOWN", "COMMITTED", "ABORTED"):
             raise ValueError("invalid persisted Rebase attempt")
         result = json.loads(raw_result) if raw_result is not None else None
         if state == "COMMITTED" and not isinstance(result, dict):

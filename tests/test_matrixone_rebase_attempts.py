@@ -44,7 +44,7 @@ class AttemptStoreTest(unittest.TestCase):
         self.conn.get_autocommit.return_value = True
         self.cur = self.conn.cursor.return_value.__enter__.return_value
         self.cur.fetchone.side_effect = [("bench_feature", 0), ("bench", 0)]
-        self.cur.fetchall.side_effect = [[(17, 3)], [(11,)],
+        self.cur.fetchall.side_effect = [[], [(17, 3)], [(11,)],
                                         [base_record(base())],
                                         [base_record(base("bench", "base_upstream", 11))]]
         self.cur.rowcount = 1
@@ -68,13 +68,13 @@ class AttemptStoreTest(unittest.TestCase):
         self.assertIn(ATTEMPT, result.candidate_db)
         self.assertLessEqual(len(result.candidate_db), 64)
         statements = [call.args for call in self.cur.execute.call_args_list]
-        self.assertEqual(len(statements), 10)
+        self.assertEqual(len(statements), 11)
         self.assertIn("rebase_snapshot_requests", statements[1][0])
         self.assertIn("FOR UPDATE", statements[3][0])
-        self.assertIn("current_account_id()", statements[5][0])
         self.assertIn("current_account_id()", statements[6][0])
-        self.assertEqual(statements[7][1], ("base_feature",))
-        self.assertEqual(statements[8][1], ("base_upstream",))
+        self.assertIn("current_account_id()", statements[7][0])
+        self.assertEqual(statements[8][1], ("base_feature",))
+        self.assertEqual(statements[9][1], ("base_upstream",))
         self.assertEqual(statements[-1][1][:3], (ATTEMPT, "feature", "PREPARING"))
         self.assertEqual(json.loads(statements[-1][1][3]), asdict(result))
         self.assertFalse(any("SNAPSHOT" in sql[0] or "REBASE" in sql[0]
@@ -131,7 +131,7 @@ class AttemptStoreTest(unittest.TestCase):
         for rows in ([], [(17, 3), (17, 4)], [(17, 0)], [(17, 2 ** 64 - 1)]):
             with self.subTest(rows=rows):
                 self.setUp()
-                self.cur.fetchall.side_effect = [rows, [(11,)], [base_record(base())],
+                self.cur.fetchall.side_effect = [[], rows, [(11,)], [base_record(base())],
                                                 [base_record(base("bench", "base_upstream", 11))]]
                 with self.assertRaises(ValueError):
                     self.prepare("feature", "main", ATTEMPT)
@@ -145,6 +145,18 @@ class AttemptStoreTest(unittest.TestCase):
             with self.subTest(args=args), self.assertRaises(ValueError):
                 self.prepare(*args)
         self.connect.assert_not_called()
+
+    def test_pending_branch_attempt_blocks_fresh_publication_without_new_intent(self):
+        self.cur.fetchall.side_effect = [[("f" * 32,)]]
+        with self.assertRaises(RebaseAttemptUnknown) as caught:
+            self.prepare("feature", "main", ATTEMPT)
+        self.assertEqual(caught.exception.attempt_id, "f" * 32)
+        statements = [call.args for call in self.cur.execute.call_args_list]
+        self.assertIn("FOR UPDATE", statements[3][0])
+        self.assertEqual(statements[4][1], ("feature", "PREPARING", "PUBLISHING", "UNKNOWN"))
+        self.assertFalse(any(sql.startswith("INSERT") for sql, *_ in statements))
+        self.conn.rollback.assert_called_once()
+        self.conn.commit.assert_not_called()
 
     def test_conflict_policy_is_persisted_and_callbacks_fail_before_connection(self):
         for policy in ("fail", "ours", "theirs"):
@@ -295,7 +307,7 @@ class AttemptStoreTest(unittest.TestCase):
             for role in ("feature", "upstream"):
                 with self.subTest(bad=bad, role=role):
                     self.setUp()
-                    self.cur.fetchall.side_effect = [[(17, 3)], [(11,)]] + (
+                    self.cur.fetchall.side_effect = [[], [(17, 3)], [(11,)]] + (
                         [bad] if role == "feature" else [[valid], bad])
                     with self.assertRaises(ValueError):
                         self.prepare("feature", "main", ATTEMPT)

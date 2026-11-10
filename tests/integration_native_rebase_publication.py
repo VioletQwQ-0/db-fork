@@ -48,9 +48,12 @@ def execute(bridge):
     if set(config) != {"port"} or type(config["port"]) is not int or not 0 < config["port"] < 65536:
         raise ValueError("invalid private fixture endpoint")
     query_log = (bridge / "adapter-sql.jsonl").open("x")
+    native_queries = 0
 
     class ObservedCursor(pymysql.cursors.Cursor):
         def execute(self, query, args=None):
+            nonlocal native_queries
+            native_queries += int(query.startswith("DATA BRANCH REBASE DATABASE "))
             query_log.write(json.dumps({"sql": query, "params": args}, default=str) + "\n")
             query_log.flush()
             return super().execute(query, args)
@@ -191,8 +194,15 @@ def execute(bridge):
         for database, table, value in ((case_f, "a_ok", 11), (case_f, "z_bad", 11), (case_u, "a_ok", 10), (case_u, "z_bad", 12)):
             check(sql(f"SELECT id,v FROM {database}.{table} ORDER BY id"), ((1, value),), "multi-table rollback")
         rollback = fresh_recovery(failed.attempt_id, "rollback")
-        check(rollback["state"], "UNKNOWN", "failed transaction remains unpublished")
+        check(rollback["state"], "ABORTED", "acknowledged rollback and confirmed requests permit durable abort")
         check([item["state"] for item in rollback["snapshots"]], ["CONFIRMED", "CONFIRMED"], "failed transaction receipts")
+        replacement = store.prepare(branch, "up_rollback", source_registration=(case_f, 0),
+                                    upstream_registration=(case_u, 0),
+                                    feature_base=(failed.feature_base.database, failed.feature_base.snapshot),
+                                    upstream_base=(failed.upstream_base.database, failed.upstream_base.snapshot),
+                                    base_sequence=20)
+        databases.append(replacement.candidate_db)
+        check(replacement.source_id, failed.source_id, "proven abort permits a fresh intent, not replay of old attempt")
         kills = {}
         for mode in ("snapshot", "before_commit", "after_commit"):
             intent, branch, case_u, case_f = private_case(mode)
@@ -250,7 +260,7 @@ def execute(bridge):
                 check(sql("SELECT count(*) FROM mo_catalog.mo_database WHERE datname=%s", (case_f,)), ((0,),), "committed source retired")
                 check(sql(f"SELECT db,gen FROM {metadata}.branches WHERE name=%s", (branch,)), ((intent.candidate_db, 1),), "no repeated pointer publication")
             else:
-                check(lock_state, (("PREPARING",),), "uncommitted durable intent")
+                check(lock_state, (("PREPARING" if mode == "snapshot" else "PUBLISHING",),), "uncommitted durable intent")
                 check(recovered["state"], "UNKNOWN", "pending resources must remain unknown")
                 check_unpublished(intent, branch, case_f)
                 check(state(case_f), ((1, 11),), "source unchanged after killed child")
@@ -258,6 +268,31 @@ def execute(bridge):
                 check([item["state"] for item in recovered["snapshots"]], expected_receipts, "pending receipts preserved")
             check(state(case_u), ((1, 10),), "upstream unchanged by killed child")
             check(receipt["native_sql_requests"], 0 if mode == "snapshot" else 1, "no duplicate native replay")
+            before_native = native_queries
+            try:
+                store.publish(intent.attempt_id)
+            except native.RebaseAttemptUnknown as exc:
+                check(exc.attempt_id, intent.attempt_id, "single-send fence returns original attempt")
+                if mode == "after_commit":
+                    raise
+            except ValueError:
+                if mode != "after_commit":
+                    raise
+            else:
+                raise AssertionError("a killed or terminal publication was replayed")
+            check(native_queries, before_native, "retry cannot send a second native SQL")
+            if mode != "after_commit":
+                try:
+                    store.prepare(branch, "up_" + mode, source_registration=(case_f, 0),
+                                  upstream_registration=(case_u, 0),
+                                  feature_base=(intent.feature_base.database, intent.feature_base.snapshot),
+                                  upstream_base=(intent.upstream_base.database, intent.upstream_base.snapshot),
+                                  base_sequence=20)
+                except native.RebaseAttemptUnknown as exc:
+                    check(exc.attempt_id, intent.attempt_id, "new attempt cannot bypass pending result")
+                else:
+                    raise AssertionError("pending branch admitted a replacement publication")
+                check(sql(f"SELECT count(*) FROM {metadata}.rebase_attempts WHERE branch=%s", (branch,)), ((1,),), "only original attempt retained")
             for name in ((intent.feature_snapshot,) if mode == "snapshot" else (intent.feature_snapshot, intent.upstream_snapshot)):
                 check(sql("SELECT count(*) FROM mo_catalog.mo_snapshots WHERE account_name=current_account_name() AND sname=%s", (name,)), ((1,),), "recovery must retain snapshots")
             receipt.update(status="PASS", recovered_state=recovered["state"], backend_and_relay_closed=True)
@@ -350,6 +385,7 @@ def execute(bridge):
                   ",".join("%s" for _ in snapshots) + ")", tuple(snapshots)), (), "precise snapshot cleanup")
         return {"status": "PASS_REAL_NATIVE_ADAPTER_PUBLICATION", "publications": 3, "main_path_publications": 2,
                 "rollback_verified": True, "kill_cases": 3, "killed_client_recovery": kills,
+                "single_send_verified": True, "known_abort_verified": True, "pending_branch_fence_verified": True,
                 "historical_reads": 2, "merge_verified": True, "cleanup_complete": True,
                 "adapter_sha256": hashlib.sha256(Path(native.__file__).read_bytes()).hexdigest()}
     finally:

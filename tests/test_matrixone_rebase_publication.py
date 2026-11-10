@@ -21,6 +21,9 @@ class PublicationTest(unittest.TestCase):
         self.resources = [receipt(confirmed=True), receipt("upstream", True)]
         self.add_connection([[record(value=self.value, state=terminal or "PREPARING",
                                     result={} if terminal == "COMMITTED" else None)], self.resources])
+        self.claimer, self.claim_cursor = self.add_connection([
+            [record(value=self.value, state=terminal or "PREPARING",
+                    result={} if terminal == "COMMITTED" else None)], self.resources])
         self.fixed_before = [[base_record(self.value.feature_base)],
                              [base_record(self.value.upstream_base)],
                              [snapshot()], [snapshot("upstream")]]
@@ -32,14 +35,16 @@ class PublicationTest(unittest.TestCase):
         self.own = [(90, 2)]
         self.schema = [("t", "id", "INT", "PRI"), ("t", "v", "int", "")]
         self.publisher, self.cursor = self.add_connection([
-            [record(value=self.value)], self.resources, *self.fixed_before,
+            [record(value=self.value, state="PUBLISHING")], self.resources, *self.fixed_before,
             self.candidate_rows, self.table_rows, self.summary_rows, *self.fixed_after,
             self.maximum, self.own, self.schema])
+        self.aborter, self.abort_cursor = self.add_connection([
+            [record(value=self.value, state="PUBLISHING")], self.resources])
         self.failure = None
         self.affected = {}
 
         def execute(query, params=None):
-            self.events.append((1, "execute", query, params))
+            self.events.append((2, "execute", query, params))
             operation = None
             if query.startswith("DATA BRANCH REBASE"):
                 operation = "native"
@@ -56,14 +61,14 @@ class PublicationTest(unittest.TestCase):
         self.cursor.execute.side_effect = execute
 
     def statements(self):
-        return [event[2:] for event in self.events if len(event) > 2 and event[0] == 1]
+        return [event[2:] for event in self.events if len(event) > 2 and event[0] == 2]
 
-    def assert_rolled_back(self):
-        self.publisher.rollback.assert_called_once()
+    def assert_rolled_back(self, claimed=True):
+        (self.publisher if claimed else self.claimer).rollback.assert_called_once()
         self.publisher.commit.assert_not_called()
-        for conn in self.connections:
+        for conn in self.connections[:self.connect.call_count]:
             conn.close.assert_called_once()
-        self.assertEqual(self.connect.call_count, 2)
+        self.assertEqual(self.connect.call_count, 4 if self.aborter.commit.called else 3 if claimed else 2)
 
     def test_same_owner_publishes_marker_history_cas_retirement_and_success(self):
         self.flow()
@@ -94,9 +99,13 @@ class PublicationTest(unittest.TestCase):
         self.publisher.begin.assert_called_once()
         self.publisher.commit.assert_called_once()
         self.publisher.rollback.assert_not_called()
+        self.claimer.commit.assert_called_once()
+        self.aborter.begin.assert_not_called()
+        claim = self.claim_cursor.execute.call_args.args
+        self.assertEqual(claim[1], ("PUBLISHING", ATTEMPT, "PREPARING"))
         self.connections[0].commit.assert_not_called()
         self.assertFalse(any(q.startswith(("CREATE SNAPSHOT", "DROP SNAPSHOT", "DELETE")) for q, _ in statements))
-        for conn in self.connections:
+        for conn in self.connections[:self.connect.call_count]:
             conn.close.assert_called_once()
 
     def test_policy_comes_from_durable_intent_not_a_retry_argument(self):
@@ -129,7 +138,7 @@ class PublicationTest(unittest.TestCase):
                     self.candidate_rows.append((99,))
                 with self.assertRaises(RebaseAttemptUnknown):
                     self.store.publish(ATTEMPT)
-                self.assert_rolled_back()
+                self.assert_rolled_back(claimed=change != "pending_snapshot")
                 self.assertFalse(any(q.startswith(("DATA BRANCH", "DROP", "INSERT", "UPDATE")) for q, _ in self.statements()))
 
     def test_snapshot_name_rebound_before_or_during_admission_rolls_back(self):
@@ -197,8 +206,64 @@ class PublicationTest(unittest.TestCase):
         self.assertEqual(caught.exception.attempt_id, ATTEMPT)
         self.publisher.commit.assert_called_once()
         self.publisher.rollback.assert_not_called()
-        self.assertEqual(self.connect.call_count, 2)
+        self.assertEqual(self.connect.call_count, 3)
         self.assertEqual(sum(q.startswith("DATA BRANCH REBASE") for q, _ in self.statements()), 1)
+        self.aborter.begin.assert_not_called()
+
+    def test_claim_response_loss_cannot_send_native_sql(self):
+        self.flow()
+        self.claimer.commit.side_effect = OSError("claim commit response lost")
+        with self.assertRaises(RebaseAttemptUnknown):
+            self.store.publish(ATTEMPT)
+        self.claimer.rollback.assert_not_called()
+        self.publisher.begin.assert_not_called()
+        self.aborter.begin.assert_not_called()
+        self.assertEqual(self.connect.call_count, 2)
+        self.assertFalse(self.statements())
+
+    def test_already_claimed_or_unknown_attempt_cannot_publish_again(self):
+        for state in ("PUBLISHING", "UNKNOWN"):
+            with self.subTest(state=state):
+                self.setUp()
+                self.flow(terminal=state)
+                with self.assertRaises(RebaseAttemptUnknown):
+                    self.store.publish(ATTEMPT)
+                self.claimer.rollback.assert_called_once()
+                self.publisher.begin.assert_not_called()
+                self.assertFalse(self.statements())
+
+    def test_known_rollback_records_abort_only_after_acknowledgement(self):
+        self.flow()
+        self.failure = "native"
+        with self.assertRaisesRegex(RuntimeError, "injected native"):
+            self.store.publish(ATTEMPT)
+        rollback = self.events.index((2, "rollback"))
+        begin_abort = self.events.index((3, "begin"))
+        self.assertLess(rollback, begin_abort)
+        query, params = self.abort_cursor.execute.call_args.args
+        self.assertIn("UPDATE", query)
+        self.assertEqual(params, ("ABORTED", '{"error_type": "RuntimeError"}', ATTEMPT, "PUBLISHING"))
+        self.aborter.commit.assert_called_once()
+        self.assertFalse(any(event[2].startswith(("DELETE", "DROP SNAPSHOT"))
+                             for event in self.events if len(event)>2))
+
+    def test_unknown_rollback_or_abort_commit_remains_unknown(self):
+        for stage in ("rollback", "abort_commit"):
+            with self.subTest(stage=stage):
+                self.setUp()
+                self.flow()
+                self.failure = "native"
+                if stage == "rollback":
+                    self.publisher.rollback.side_effect = OSError("rollback acknowledgement lost")
+                else:
+                    self.aborter.commit.side_effect = OSError("abort acknowledgement lost")
+                with self.assertRaises(RebaseAttemptUnknown):
+                    self.store.publish(ATTEMPT)
+                if stage == "rollback":
+                    self.aborter.begin.assert_not_called()
+                else:
+                    self.aborter.rollback.assert_not_called()
+                self.assertEqual(sum(q.startswith("DATA BRANCH REBASE") for q, _ in self.statements()), 1)
 
     def test_no_feature_commit_append_needs_no_copy_statement(self):
         self.flow()

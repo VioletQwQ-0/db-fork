@@ -9,6 +9,36 @@ Base adapter: `c2737beaf503dd1f3208efc457d369040f0aca40` (`mo-opt`). The normal
 `_rebase_impl` and generic benchmark API remain unchanged. Kernel R1 and R2
 integration have independent source identities and acceptance requirements.
 
+## Single-Send Publication And Proven Rollback (Current Slice)
+
+Design decision: PREPARING alone cannot distinguish a never-sent publication
+from a lost request result. Before native SQL, a separate branch-then-attempt
+transaction consumes PREPARING into PUBLISHING, after both independent snapshots
+are CONFIRMED. Only the caller that acknowledged this claim may send publication.
+A second publisher cannot consume PUBLISHING, including after client death.
+New intent preparation under the same branch lock refuses any PREPARING,
+PUBLISHING or UNKNOWN attempt and returns its original ID for recovery.
+
+The data/base/history/CAS/retirement/COMMITTED write remains one transaction;
+its conditional success row now requires PUBLISHING. Recovery maps PUBLISHING
+to UNKNOWN and never sends SQL again. A claim COMMIT with unknown response sends
+no native SQL. A publication COMMIT with unknown response does not roll back,
+retry or abort. No wall-clock timeout or missing candidate proves rollback.
+
+Only an acknowledged rollback of that exact publication owner plus both durable
+CONFIRMED snapshot receipts allows a new branch-then-attempt transaction to
+record ABORTED. A failed/unknown rollback or abort commit stays UNKNOWN. Abort
+does not delete any snapshot/database or prove reference-safe GC. Interrupted
+clients have no durable rollback acknowledgement, so remain UNKNOWN. These
+transitions do not enable production or normal benchmark routing.
+
+Required tests: single claim, both uncertain COMMIT boundaries, known/unknown
+rollback, abort failure, pending-branch retry refusal, real client SIGKILL and
+unchanged atomic publication/history oracles. Offline tests and the real adapter
+process fixture cover this closure, including killed-client non-republication,
+known ABORTED recovery and new-intent admission only after proven abort. This is
+not normal Suite API or production reference-safe GC acceptance.
+
 ## Invariants And Ownership
 
 `RebaseAttemptStore` owns one fresh connection per call. `prepare` commits a
@@ -54,7 +84,7 @@ No credentials or connection strings are recorded in the intent.
   locking reads use NOWAIT: a busy publisher returns `UNKNOWN`, not a stalled
   recovery operation or rollback inference. Lock-wait timeout, deadlock and
   uncertain recovery-transaction completion also remain `UNKNOWN`; other
-  read errors propagate. Absent, `PREPARING` or `UNKNOWN` records return
+  read errors propagate. Absent, `PREPARING`, `PUBLISHING` or `UNKNOWN` records return
   `UNKNOWN`. A stored `COMMITTED` result survives an advanced or removed
   current branch registration; recovery never derives its outcome from the
   current pointer. Changed immutable identity or terminal evidence is rejected.
@@ -109,8 +139,8 @@ pending-to-committed rereads, missing/advanced registration, both busy lock
 positions, release uncertainty, immutable-identity/terminal-result corruption,
 and retained pending resources. These are offline owner/ordering oracles, not
 proof that two actual database transactions conflict or that a killed client
-recovers safely. No ABORTED writer, publication or resource reclamation is
-enabled by this slice.
+recovers safely. Inspection stays read-only. Only the publisher's acknowledged
+rollback and confirmed-request path may write ABORTED; it reclaims no resources.
 
 ## Native Generation Identity
 
@@ -197,8 +227,9 @@ snapshot preparation. A callback is rejected before opening a connection.
 Earlier unpublished draft intents without that new optional field mean fail,
 never an inferred policy from the current caller.
 
-Use a fresh existing RC transaction and the established branch-then-attempt
-lock order. Require the original source registration and PREPARING intent,
+Use the established branch-then-attempt lock order to claim PREPARING into
+PUBLISHING before native SQL. The fresh RC publication transaction requires the
+original source registration and that PUBLISHING intent,
 canonical candidate name, both CONFIRMED receipts and all four original
 snapshot identities. A current pointer or a visible snapshot is not a terminal
 request receipt. Existing candidates are retained and rejected, not dropped.
@@ -255,10 +286,10 @@ commit or cross-CN acceptance. Normal benchmark routing remains unchanged.
 
 An uncertain COMMIT returns UNKNOWN and performs no retry or cleanup. Explicit
 publication refuses a terminal attempt and directs callers to recover the
-original result rather than republish it. An acknowledged pre-commit rollback
-also does not authorize speculative snapshot cleanup; pending attempts remain
-retained until the separate durable abort-proof path is implemented. This is a
-conservative unfinished recovery state, not full R2 acceptance.
+original result rather than republish it. An acknowledged publication rollback
+with both requests CONFIRMED can now persist ABORTED through the single-send
+protocol. This still does not authorize speculative snapshot cleanup or establish
+full R2 acceptance.
 
 Review decision: PASS for this disabled implementation slice. Offline DB-API
 tests must cover same-owner order, policy binding, fixed endpoint identity,
@@ -309,8 +340,8 @@ Add a two-PK-table conflict case: first sorted table has a valid feature change,
 second has conflicting edits. The existing native applied-table hook records
 that the first table was actually processed before the error. Independently
 assert complete source/upstream rows, original epoch/registration, no candidate
-and PREPARING attempt with both confirmed receipts. No full-data scale or new
-service fixture is needed.
+and an ABORTED attempt with both confirmed receipts after rollback is acknowledged.
+No full-data scale or new service fixture is needed.
 
 Review decision: PASS for these test-only owner/transport closures. Unit tests
 must prove fragmentation, unchanged pass-through, request-vs-response barriers,

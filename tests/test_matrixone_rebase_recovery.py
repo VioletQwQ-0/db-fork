@@ -66,6 +66,13 @@ class LockedRecoveryTest(unittest.TestCase):
         conn.commit.assert_called_once()
         self.assert_no_publication_or_cleanup()
 
+    def test_claimed_publication_stays_unknown_without_replay_or_abort(self):
+        self.add_recovery(record("PUBLISHING"))
+        outcome = self.store.recover(ATTEMPT)
+        self.assertEqual(outcome["state"], "UNKNOWN")
+        self.assertIsNone(outcome["result"])
+        self.assert_no_publication_or_cleanup()
+
     def test_lock_wait_and_deadlock_are_unknown_not_aborted(self):
         for code in (1205, 1213, 3572):
             for relation in ("branches", "rebase_attempts"):
