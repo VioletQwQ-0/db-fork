@@ -317,3 +317,23 @@ must prove fragmentation, unchanged pass-through, request-vs-response barriers,
 wrong server response refusal and exact shutdown. Real-process evidence is
 still required; proxy unit tests do not replace it. Existing resource gates and
 exclusive lease remain in force, and production R2 stays disabled.
+
+## Actual ToolSuite Call-Chain Acceptance
+
+The ToolSuite fixture uses the unchanged MatrixOneToolSuite constructor, branch and
+commit API, schema fingerprint, real ResultCollector and generation resolution.
+Its native publication is the existing explicit MO helper chain (prepare,
+request snapshots, publish), not the ordinary legacy rebase route. No generic
+API/default routing or server activation is changed by this fixture.
+
+Create tiny explicit-PK data and an unchanged duplicate/NULL bag, make actual
+fork/commit history, publish twice after independent upstream/feature edits,
+then Merge using the real Suite method. Check complete rows, old commit refs,
+the first durable result after the branch advances, base direction and the
+second delta window. Two further source branches conflict on one key and
+prove ours=upstream and theirs=feature. Track SQL-issued fixture snapshots and
+known databases exactly; no database/snapshot cleanup follows failed evidence.
+Success closes the Suite before explicit resource teardown and confirms every
+owned user snapshot/database absent. This is still not production GC or a
+performance experiment. Linux client dependencies are pinned by wheel hashes;
+no database, driver, ledger, ResultCollector or protobuf module is mocked.
