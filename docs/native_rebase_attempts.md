@@ -1,13 +1,36 @@
 # Native Rebase: Durable Intent And Snapshot Preparation
 
-Status: normal benchmark Rebase is unchanged and native publication is disabled.
-Explicit helpers persist intent, prepare its two snapshots, inspect receipts
-and implement the disabled candidate publisher; this is not the complete native
-Rebase or recovery implementation.
+Status: the normal benchmark backend is unchanged. Production native publication
+is disabled. An explicit candidate Suite exposes the public Rebase API for
+controlled correctness and performance qualification only.
 
 Base adapter: `c2737beaf503dd1f3208efc457d369040f0aca40` (`mo-opt`). The normal
 `_rebase_impl` and generic benchmark API remain unchanged. Kernel R1 and R2
 integration have independent source identities and acceptance requirements.
+
+## Explicit Public API
+
+`dblib.matrixone_native_rebase.NativeRebaseMatrixOneToolSuite` is an opt-in
+subclass, not a registered benchmark backend. It inherits the real public
+`rebase()` timer, collector and error reporting, with a native implementation
+label only on this class. The default `MatrixOneToolSuite` remains simulated.
+The candidate requires the qualified server's test-only EXPECT admission;
+there is no new production switch or silent compatibility fallback.
+
+The public path prepares one durable attempt, requests its fixed snapshots,
+and claims and publishes it once. It never falls back to legacy SQL, creates a
+replacement attempt on failure, or retries an unknown result. Pinned endpoints
+and custom conflict callbacks are rejected before intent or snapshot creation.
+`ours` retains the fixed upstream and `theirs` retains the branch. Result counts
+map to upstream/feature changed keys and conflict keys; the result also retains
+the original attempt ID, fixed upstream identity and native statement timing.
+
+The real public-API fixture covers consecutive feature publications, Rebase of
+main onto its child, old-generation historical reads, Merge, both policies and
+unsupported no-SQL rejection. This is separate from the prior helper-only
+fixture and real client-death acceptance. Neither class performs automatic
+snapshot reclamation. UNKNOWN resources and historical snapshot references are
+retained; fixture-local terminal cleanup is not production GC qualification.
 
 ## Single-Send Publication And Proven Rollback (Current Slice)
 
@@ -131,8 +154,10 @@ select a different publication algorithm.
 Offline tests exercise DB-API call ordering, parameter binding, boundaries,
 commit uncertainty, connection cleanup and read-only inspection. They do not
 prove transaction conflicts, WAL recovery or actual adapter process death.
-Those real-database and real-process acceptance gates remain `NOT_RUN` for
-this module. Performance is not measured at this stage.
+The separate integration fixtures provide real-database and real-process
+acceptance for their explicitly selected contracts. Offline tests alone do not
+provide those claims. Performance is measured separately, never from fixture
+wall time or SQL-count reduction alone.
 
 The locked-recovery tests additionally cover branch-before-attempt NOWAIT,
 pending-to-committed rereads, missing/advanced registration, both busy lock

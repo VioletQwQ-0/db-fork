@@ -22,7 +22,7 @@ def save(path, value):
     temporary.replace(path)
 
 
-def execute(bridge):
+def execute(bridge, native_api=False):
     ready = json.loads((bridge / "ready.json").read_text())
     if set(ready) != {"port"} or type(ready["port"]) is not int or not 0 < ready["port"] < 65536:
         raise ValueError("invalid private bridge endpoint")
@@ -32,6 +32,7 @@ def execute(bridge):
     from dblib import result_pb2 as rslt
     from dblib.db_api import Ref
     from dblib.result_collector import ResultCollector
+    from dblib.matrixone_native_rebase import NativeRebaseMatrixOneToolSuite
 
     log = (bridge / "adapter-sql.jsonl").open("x")
     snapshots, databases = set(), set()
@@ -85,12 +86,30 @@ def execute(bridge):
         for result in suite.exec(statements, refs=[ref], raise_on_error=True):
             verb(result)
 
-    def native_publish(branch, policy="fail"):
-        intent = suite._prepare_native_rebase_attempt(Ref(branch), Ref("main"), policy)
+    public_calls = 0
+
+    def native_publish(branch, policy="theirs", onto="main"):
+        nonlocal public_calls
+        if native_api:
+            operation = suite.rebase(branch, onto, on_conflict=policy, raise_on_error=True)
+            result = verb(operation)
+            check(operation.execution_paths, ["native_rebase_publication"], "public native route")
+            check(operation.fallback_reasons, [], "no legacy fallback")
+            recovered = suite.recover_rebase(result["attempt_id"])
+            intent = native.RebaseIntent(**recovered["intent"])
+            check((result["conflicts"], result["ours_changes"], result["theirs_changes"]),
+                  tuple(result["native_summary"][key] for key in
+                        ("conflict_keys", "upstream_changed_keys", "feature_changed_keys")), "public counters")
+            for key, value in recovered["result"].items():
+                check(result[key], value, "public result matches durable success")
+            result = recovered["result"]
+            public_calls += 1
+        else:
+            intent = suite._prepare_native_rebase_attempt(Ref(branch), Ref(onto), policy)
+            receipt = suite._request_native_rebase_snapshots(intent.attempt_id)
+            check([item["state"] for item in receipt["snapshots"]], ["CONFIRMED", "CONFIRMED"], "real Suite snapshot receipts")
+            result = suite._publish_native_rebase_attempt(intent.attempt_id)
         databases.add(intent.candidate_db)
-        receipt = suite._request_native_rebase_snapshots(intent.attempt_id)
-        check([item["state"] for item in receipt["snapshots"]], ["CONFIRMED", "CONFIRMED"], "real Suite snapshot receipts")
-        result = suite._publish_native_rebase_attempt(intent.attempt_id)
         check(suite.recover_rebase(intent.attempt_id)["result"], result, "real Suite recovery")
         check(sql("SELECT count(*) FROM mo_catalog.mo_database WHERE account_id=current_account_id() AND datname=%s",
                   (intent.source_db,)), ((0,),), "real Suite source retired")
@@ -108,7 +127,10 @@ def execute(bridge):
         sql(f"INSERT INTO {database}.history VALUES(1),(1),(NULL)")
         collector = ResultCollector(run_id="native-toolsuite", output_dir=str(bridge / "collector"))
         suite_connection = mo.connect(None, read_timeout=30, write_timeout=30)
-        suite = mo.MatrixOneToolSuite(suite_connection, collector, database)
+        suite_type = NativeRebaseMatrixOneToolSuite if native_api else mo.MatrixOneToolSuite
+        suite = suite_type(suite_connection, collector, database)
+        check(mo.MatrixOneToolSuite.implementation()["rebase"], "simulated", "default native route stays disabled")
+        check(suite.implementation()["rebase"], "native" if native_api else "simulated", "explicit route capability")
         verb(suite.commit("main", "base", raise_on_error=True))
         verb(suite.branch("feature", "main", raise_on_error=True))
         databases.add(mo.branch_db_name(database, "feature"))
@@ -139,6 +161,19 @@ def execute(bridge):
             check(sum(item["commit_hash"] == commit for item in commits), 1, "real Suite preserved commit identity")
         verb(suite.merge("main", "feature", on_conflict="theirs", raise_on_error=True))
         check(rows("main"), expected, "real Suite Merge after two native publications")
+        if native_api:
+            verb(suite.branch("reverse", "main", raise_on_error=True))
+            databases.add(mo.branch_db_name(database, "reverse"))
+            change("main", ["INSERT INTO items VALUES(6,60)"])
+            old_main = verb(suite.commit("main", "before reverse publication", raise_on_error=True))
+            change("reverse", ["INSERT INTO items VALUES(7,70)"])
+            verb(suite.commit("reverse", "reverse upstream", raise_on_error=True))
+            reverse, _ = native_publish("main", onto="reverse")
+            check(reverse.source_db, database, "reverse publication retires original main")
+            check(rows("main@" + old_main), expected + ((6, 60),), "retired main historical read")
+            check(rows("reverse"), expected + ((7, 70),), "reverse upstream preserved")
+            expected += ((6, 60), (7, 70))
+            check(rows("main"), expected, "public reverse main publication")
         for branch, value in (("keep_u", 200), ("keep_f", 300)):
             verb(suite.branch(branch, "main", raise_on_error=True))
             databases.add(mo.branch_db_name(database, branch))
@@ -155,6 +190,13 @@ def execute(bridge):
               ((3, 2, 1),), "real Suite unchanged no-PK bag")
         if not collector.results or any(result.status != rslt.OpStatus.OK for result in collector.results):
             raise AssertionError("real result collector contains missing or failed Suite operations")
+        if native_api:
+            before_requests = queries
+            for source, policy in (("feature@" + first_commit, "ours"), ("feature", lambda *args: None)):
+                rejected = suite.rebase(source, "main", on_conflict=policy)
+                check(rejected.unsupported, True, "native unsupported input is rejected")
+            check(queries, before_requests, "unsupported input sends no SQL")
+            check(public_calls, 5, "all publications used public API")
         database_state = sql("SELECT db FROM " + native._identifier(suite._meta_db) + ".branches")
         databases.update(row[0] for row in database_state)
         databases.update(suite._temp_dbs.values())
@@ -170,8 +212,10 @@ def execute(bridge):
                                             ("mo_catalog.mo_snapshots", "sname", snapshots)):
             check(sql(f"SELECT {column} FROM {relation} WHERE {column} IN (" +
                       ",".join("%s" for _ in resources) + ")", tuple(sorted(resources))), (), "real Suite exact cleanup")
-        return {"status": "PASS_REAL_MATRIXONE_TOOLSUITE_NATIVE_REBASE", "publications": 4,
-                "historical_reads": 2, "policies": 2, "merge_verified": True, "cleanup_complete": True,
+        return {"status": "PASS_REAL_MATRIXONE_PUBLIC_NATIVE_REBASE" if native_api else "PASS_REAL_MATRIXONE_TOOLSUITE_NATIVE_REBASE",
+                "publications": 5 if native_api else 4, "public_api_calls": public_calls,
+                "reverse_main_verified": native_api, "unsupported_rejections": 2 if native_api else 0,
+                "historical_reads": 3 if native_api else 2, "policies": 2, "merge_verified": True, "cleanup_complete": True,
                 "suite_sha256": hashlib.sha256(Path(mo.__file__).read_bytes()).hexdigest(),
                 "adapter_sha256": hashlib.sha256(Path(native.__file__).read_bytes()).hexdigest(),
                 "collector_operations": len(collector.results), "sql_statements": queries,
@@ -190,9 +234,10 @@ def execute(bridge):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--bridge", type=Path, required=True)
+    parser.add_argument("--native-api", action="store_true")
     args = parser.parse_args()
     try:
-        value = execute(args.bridge)
+        value = execute(args.bridge, args.native_api)
     except BaseException as exc:
         traceback.print_exc(file=sys.stderr)
         save(args.bridge / "result.json", {"status": "FAIL", "category": type(exc).__name__, "cleanup_complete": False})
