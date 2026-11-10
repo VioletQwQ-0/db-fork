@@ -266,3 +266,54 @@ history/base correctness, exact CAS/affected rows, overflow, rollback at each
 mutation, and unknown commit without retry. Real adapter subprocess tests,
 continuous Rebase/Merge/history and recovery are mandatory before enabling the
 normal path. A model PASS does not establish storage atomicity or completion.
+
+## Deterministic Real-Client Failure Acceptance
+
+The next test-only slice reuses that same private cluster and starts actual
+adapter subprocesses. A bounded plaintext MySQL packet relay is necessary to
+distinguish a server COMMIT from receipt of its response; a Python exception
+after conn.commit() would not establish the requested lost-response condition.
+The relay is fixture code only, binds loopback, admits at most8 connections and
+limits a packet to1MiB. It forwards authentication without recording it and
+logs only COM_QUERY SQL from the private test. It does not parse general SQL.
+
+Three observable barriers drive exact-child SIGKILL, never scheduler sleeps:
+- snapshot: the exact preallocated CREATE SNAPSHOT has a server OK held before
+  forwarding to the child; its durable request remains REQUESTED;
+- before_commit: after the publication success-row UPDATE, hold its COMMIT
+  request before forwarding; a fresh recovery must see the busy publisher as
+  UNKNOWN, then child death/backend closure must leave source/epoch/pointer
+  unchanged and candidate absent;
+- after_commit: forward that COMMIT and hold its server OK before the child
+  receives it; a direct independent query must prove COMMITTED before killing
+  the child, then a fresh Python process must return that exact durable result
+  without another publication or cleanup.
+
+Each barrier is acknowledged by the relay, including whether the request was
+forwarded/OK withheld. Recovery starts a new interpreter with only connection
+configuration, metadata DB and original attempt ID; no returned in-memory
+intent/result is supplied. Record exact owned PIDs and reap/close all relay
+threads/connections even on failure. Busy-state observation uses NOWAIT and
+bounded polling only for actual asynchronous lock release after disconnect.
+It is not a retry of a publication.
+
+The pending snapshot case stays UNKNOWN even if a snapshot is visible. The
+pending pre-commit case also remains conservatively UNKNOWN with the current
+recover interface; this does not qualify a durable ABORTED/production cleanup
+path. Fixture teardown can use its independently observed terminal server OK,
+dead clients/closed backend and released publication locks to remove only its
+private resources. It is not authorization for production recovery to infer
+rollback from disconnect or catalog absence.
+
+Add a two-PK-table conflict case: first sorted table has a valid feature change,
+second has conflicting edits. The existing native applied-table hook records
+that the first table was actually processed before the error. Independently
+assert complete source/upstream rows, original epoch/registration, no candidate
+and PREPARING attempt with both confirmed receipts. No full-data scale or new
+service fixture is needed.
+
+Review decision: PASS for these test-only owner/transport closures. Unit tests
+must prove fragmentation, unchanged pass-through, request-vs-response barriers,
+wrong server response refusal and exact shutdown. Real-process evidence is
+still required; proxy unit tests do not replace it. Existing resource gates and
+exclusive lease remain in force, and production R2 stays disabled.

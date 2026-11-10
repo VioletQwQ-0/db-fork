@@ -8,18 +8,39 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import signal
+import subprocess
 import sys
+import time
 import traceback
 
 import pymysql
 
 from dblib import matrixone_rebase as native
+from tests.native_rebase_wire_gate import RebaseWireGate
 
 
 def save(path, value):
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(value, sort_keys=True) + "\n")
     temporary.replace(path)
+
+
+def private_connection(port, cursorclass=pymysql.cursors.Cursor):
+    return pymysql.connect(host="127.0.0.1", port=port, user="dump", password="111",
+                           autocommit=True, connect_timeout=10, read_timeout=30, write_timeout=30,
+                           cursorclass=cursorclass)
+
+
+def child_task(mode, port, metadata, attempt):
+    queries = []
+    class Observed(pymysql.cursors.Cursor):
+        def execute(self, query, args=None):
+            queries.append(query)
+            return super().execute(query, args)
+    store = native.RebaseAttemptStore(lambda: private_connection(port, Observed), metadata)
+    action = {"snapshots": store.request_snapshots, "publish": store.publish, "recover": store.recover}[mode]
+    return {"value": action(attempt), "queries": queries}
 
 
 def execute(bridge):
@@ -35,9 +56,7 @@ def execute(bridge):
             return super().execute(query, args)
 
     def connect():
-        return pymysql.connect(host="127.0.0.1", port=config["port"], user="dump", password="111",
-                               autocommit=True, connect_timeout=10, read_timeout=30, write_timeout=30,
-                               cursorclass=ObservedCursor)
+        return private_connection(config["port"], ObservedCursor)
 
     try:
         conn = connect()
@@ -75,6 +94,177 @@ def execute(bridge):
                 seq, "fixture_" + str(seq), kind, name, database,
                 previous[1] if previous else None, previous[0] if previous else None))
 
+    def create_history(database):
+        sql(f"CREATE TABLE {database}._bb_commits("
+            "seq bigint primary key,id varchar(40) not null,kind varchar(8) not null,message text,"
+            "snap varchar(64) not null,db varchar(64) not null,prev_snap varchar(64),prev_db varchar(64),"
+            "ts datetime(6),schema_json text,key _bb_commit_id(id))")
+
+    def subprocess_command(mode, attempt, port):
+        return [sys.executable, str(Path(__file__).resolve()), "--bridge", str(bridge),
+                "--child", mode, "--attempt", attempt, "--metadata", metadata, "--port", str(port)]
+
+    def fresh_recovery(attempt, label):
+        with (bridge / (label + "-recovery-error.log")).open("x") as errors:
+            child = subprocess.Popen(subprocess_command("recover", attempt, config["port"]),
+                                     stdout=subprocess.PIPE, stderr=errors)
+            try:
+                output, _ = child.communicate(timeout=20)
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.wait(timeout=10)
+        check(child.returncode, 0, "fresh recovery process")
+        outcome = json.loads(output)
+        if any(not query.upper().startswith(("SELECT ", "SET SESSION ")) for query in outcome["queries"]):
+            raise AssertionError("recovery unexpectedly attempted publication or cleanup")
+        save(bridge / (label + "-recovery.json"), {"pid": child.pid, "returncode": child.returncode, **outcome})
+        return outcome["value"]
+
+    def wait_publication_locks_released(branch, attempt):
+        deadline = time.monotonic() + 10
+        while True:
+            probe = connect()
+            try:
+                probe.begin()
+                with probe.cursor() as cur:
+                    cur.execute(f"SELECT name FROM {metadata}.branches WHERE name=%s FOR UPDATE NOWAIT", (branch,))
+                    check(cur.fetchall(), ((branch,),), "post-exit branch lock identity")
+                    cur.execute(f"SELECT state FROM {metadata}.rebase_attempts WHERE attempt_id=%s FOR UPDATE NOWAIT", (attempt,))
+                    rows = cur.fetchall()
+                probe.rollback()
+                return rows
+            except pymysql.err.OperationalError as exc:
+                probe.rollback()
+                if not exc.args or exc.args[0] not in (1205, 1213, 3572) or time.monotonic() >= deadline:
+                    raise
+                # Observe asynchronous disconnect rollback, not retry a publish.
+                time.sleep(0.02)
+            finally:
+                probe.close()
+
+    def private_case(name, conflict=False):
+        case_u, case_f = prefix + "_" + name + "_u", prefix + "_" + name + "_f"
+        databases.extend((case_u, case_f))
+        sql(f"CREATE DATABASE {case_u}")
+        create_history(case_u)
+        for table in (("a_ok", "z_bad") if conflict else ("items",)):
+            sql(f"CREATE TABLE {case_u}.{table}(id int primary key,v int)")
+            sql(f"INSERT INTO {case_u}.{table} VALUES(1,10)")
+        ubase, fbase = prefix + "_" + name + "_bu", prefix + "_" + name + "_bf"
+        history(case_u, 10, "root", ubase)
+        snapshot(case_u, ubase)
+        sql(f"DATA BRANCH CREATE DATABASE {case_f} FROM {case_u} {{snapshot=%s}}", (ubase,))
+        history(case_f, 20, "fork", fbase, (case_u, ubase))
+        snapshot(case_f, fbase)
+        for table in (("a_ok", "z_bad") if conflict else ("items",)):
+            sql(f"UPDATE {case_f}.{table} SET v=11 WHERE id=1")
+        if conflict:
+            sql(f"UPDATE {case_u}.z_bad SET v=12 WHERE id=1")
+        source_branch, target_branch = "case_" + name, "up_" + name
+        sql(f"INSERT INTO {metadata}.branches VALUES(%s,%s,0),(%s,%s,0)",
+            (source_branch, case_f, target_branch, case_u))
+        intent = store.prepare(source_branch, target_branch, source_registration=(case_f, 0),
+                               upstream_registration=(case_u, 0), feature_base=(case_f, fbase),
+                               upstream_base=(case_u, ubase), base_sequence=20)
+        databases.append(intent.candidate_db)
+        return intent, source_branch, case_u, case_f
+
+    def check_unpublished(intent, branch, source):
+        check(sql(f"SELECT db,gen FROM {metadata}.branches WHERE name=%s", (branch,)), ((source, 0),), "unpublished pointer")
+        check(sql("SELECT epoch FROM mo_catalog.mo_database_inventory WHERE account_id=current_account_id() AND database_id=%s", (intent.source_id,)),
+              ((intent.source_epoch,),), "unpublished source epoch")
+        check(sql("SELECT count(*) FROM mo_catalog.mo_database WHERE datname=%s", (intent.candidate_db,)), ((0,),), "unpublished candidate")
+
+    def failure_and_kill_cases():
+        failed, branch, case_u, case_f = private_case("rollback", conflict=True)
+        store.request_snapshots(failed.attempt_id)
+        snapshots.extend((failed.feature_snapshot, failed.upstream_snapshot))
+        try:
+            store.publish(failed.attempt_id)
+        except pymysql.MySQLError as exc:
+            if "rebase conflict in table z_bad" not in str(exc).lower():
+                raise
+        else:
+            raise AssertionError("late-table conflict unexpectedly published")
+        check_unpublished(failed, branch, case_f)
+        for database, table, value in ((case_f, "a_ok", 11), (case_f, "z_bad", 11), (case_u, "a_ok", 10), (case_u, "z_bad", 12)):
+            check(sql(f"SELECT id,v FROM {database}.{table} ORDER BY id"), ((1, value),), "multi-table rollback")
+        rollback = fresh_recovery(failed.attempt_id, "rollback")
+        check(rollback["state"], "UNKNOWN", "failed transaction remains unpublished")
+        check([item["state"] for item in rollback["snapshots"]], ["CONFIRMED", "CONFIRMED"], "failed transaction receipts")
+        kills = {}
+        for mode in ("snapshot", "before_commit", "after_commit"):
+            intent, branch, case_u, case_f = private_case(mode)
+            if mode != "snapshot":
+                store.request_snapshots(intent.attempt_id)
+                snapshots.extend((intent.feature_snapshot, intent.upstream_snapshot))
+            gate = RebaseWireGate(config["port"], mode, bridge / (mode + "-wire.jsonl"),
+                                  snapshot_prefix=f"CREATE SNAPSHOT {native._identifier(intent.feature_snapshot)} ",
+                                  success_prefix=f"UPDATE {native._identifier(metadata)}.`rebase_attempts` SET state=")
+            publisher = None
+            receipt = {"attempt_id": intent.attempt_id, "mode": mode, "status": "FAIL"}
+            saved_success = None
+            try:
+                with (bridge / (mode + "-publisher.log")).open("x") as log:
+                    publisher = subprocess.Popen(subprocess_command("snapshots" if mode == "snapshot" else "publish",
+                                                                    intent.attempt_id, gate.port), stdout=log, stderr=subprocess.STDOUT)
+                    receipt["publisher_pid"] = publisher.pid
+                    receipt["barrier"] = gate.wait_held(publisher)
+                    save(bridge / (mode + "-kill-receipt.json"), receipt)
+                    if mode == "snapshot":
+                        check(sql("SELECT count(*) FROM mo_catalog.mo_snapshots WHERE account_name=current_account_name() AND sname=%s", (intent.feature_snapshot,)), ((1,),), "server snapshot OK proof")
+                        receipt["server_snapshot_verified"] = True
+                        snapshots.append(intent.feature_snapshot)
+                    elif mode == "before_commit":
+                        busy = fresh_recovery(intent.attempt_id, mode + "_busy")
+                        check(busy["state"], "UNKNOWN", "active publication is unknown")
+                        if "snapshots" in busy:
+                            raise AssertionError("recovery did not observe the active publication lock")
+                        receipt["busy_recovery_verified"] = True
+                    else:
+                        committed = sql(f"SELECT state,result_json FROM {metadata}.rebase_attempts WHERE attempt_id=%s", (intent.attempt_id,))
+                        check(len(committed), 1, "server COMMIT result cardinality")
+                        check(committed[0][0], "COMMITTED", "server committed before child response")
+                        saved_success = json.loads(committed[0][1])
+                        receipt["server_committed_verified"] = True
+                    check(publisher.poll(), None, "publisher still blocked before SIGKILL")
+                    publisher.kill()
+                    check(publisher.wait(timeout=10), -signal.SIGKILL, "exact publisher killed")
+                    receipt["publisher_returncode"] = publisher.returncode
+            finally:
+                if publisher is not None and publisher.poll() is None:
+                    publisher.kill()
+                    publisher.wait(timeout=10)
+                gate.close()
+                receipt["native_sql_requests"] = sum(query.startswith("DATA BRANCH REBASE DATABASE ") for query in gate.queries)
+                save(bridge / (mode + "-kill-receipt.json"), receipt)
+            lock_state = wait_publication_locks_released(branch, intent.attempt_id)
+            receipt["post_exit_lock_state"] = lock_state
+            recovered = fresh_recovery(intent.attempt_id, mode + "_after_exit")
+            if mode == "after_commit":
+                check(lock_state, (("COMMITTED",),), "committed lock state")
+                check(recovered["state"], "COMMITTED", "fresh process confirms durable success")
+                check(recovered["result"], saved_success, "exact original durable result")
+                check(state(intent.candidate_db), ((1, 11),), "committed candidate")
+                check(sql("SELECT count(*) FROM mo_catalog.mo_database WHERE datname=%s", (case_f,)), ((0,),), "committed source retired")
+                check(sql(f"SELECT db,gen FROM {metadata}.branches WHERE name=%s", (branch,)), ((intent.candidate_db, 1),), "no repeated pointer publication")
+            else:
+                check(lock_state, (("PREPARING",),), "uncommitted durable intent")
+                check(recovered["state"], "UNKNOWN", "pending resources must remain unknown")
+                check_unpublished(intent, branch, case_f)
+                check(state(case_f), ((1, 11),), "source unchanged after killed child")
+                expected_receipts = ["REQUESTED"] if mode == "snapshot" else ["CONFIRMED", "CONFIRMED"]
+                check([item["state"] for item in recovered["snapshots"]], expected_receipts, "pending receipts preserved")
+            check(state(case_u), ((1, 10),), "upstream unchanged by killed child")
+            check(receipt["native_sql_requests"], 0 if mode == "snapshot" else 1, "no duplicate native replay")
+            for name in ((intent.feature_snapshot,) if mode == "snapshot" else (intent.feature_snapshot, intent.upstream_snapshot)):
+                check(sql("SELECT count(*) FROM mo_catalog.mo_snapshots WHERE account_name=current_account_name() AND sname=%s", (name,)), ((1,),), "recovery must retain snapshots")
+            receipt.update(status="PASS", recovered_state=recovered["state"], backend_and_relay_closed=True)
+            save(bridge / (mode + "-kill-receipt.json"), receipt)
+            kills[mode] = recovered["state"]
+        return kills
+
     def prepare_and_snapshot(source, generation, feature_base, upstream_base, sequence):
         intent = store.prepare("feature", "main", source_registration=(source, generation),
                                upstream_registration=(upstream, 0), feature_base=feature_base,
@@ -91,10 +281,7 @@ def execute(bridge):
         sql(f"CREATE DATABASE {upstream}")
         sql(f"CREATE TABLE {upstream}.items(id int primary key,v int)")
         sql(f"CREATE TABLE {upstream}.history(v int)")
-        sql(f"CREATE TABLE {upstream}._bb_commits("
-            "seq bigint primary key,id varchar(40) not null,kind varchar(8) not null,message text,"
-            "snap varchar(64) not null,db varchar(64) not null,prev_snap varchar(64),prev_db varchar(64),"
-            "ts datetime(6),schema_json text,key _bb_commit_id(id))")
+        create_history(upstream)
         sql(f"INSERT INTO {upstream}.items VALUES(1,10)")
         sql(f"INSERT INTO {upstream}.history VALUES(1),(1),(NULL)")
         base_u, base_f = prefix + "_bu", prefix + "_bf"
@@ -150,6 +337,7 @@ def execute(bridge):
         check(state(upstream), expected, "merge after second rebase")
         check(sql(f"SELECT count(*),sum(v=1),sum(v is null) FROM {native._identifier(two['candidate_db'])}.history"),
               ((3, 2, 1),), "duplicate/NULL bag retained")
+        kills = failure_and_kill_cases()
         # All fixed/historical reads and durable confirmations precede cleanup.
         for name in reversed(snapshots):
             sql(f"DROP SNAPSHOT {native._identifier(name)}")
@@ -158,7 +346,10 @@ def execute(bridge):
         remaining = sql("SELECT datname FROM mo_catalog.mo_database WHERE datname IN (" +
                         ",".join("%s" for _ in databases) + ")", tuple(databases))
         check(remaining, (), "precise database cleanup")
-        return {"status": "PASS_REAL_NATIVE_ADAPTER_PUBLICATION", "publications": 2,
+        check(sql("SELECT sname FROM mo_catalog.mo_snapshots WHERE account_name=current_account_name() AND sname IN (" +
+                  ",".join("%s" for _ in snapshots) + ")", tuple(snapshots)), (), "precise snapshot cleanup")
+        return {"status": "PASS_REAL_NATIVE_ADAPTER_PUBLICATION", "publications": 3, "main_path_publications": 2,
+                "rollback_verified": True, "kill_cases": 3, "killed_client_recovery": kills,
                 "historical_reads": 2, "merge_verified": True, "cleanup_complete": True,
                 "adapter_sha256": hashlib.sha256(Path(native.__file__).read_bytes()).hexdigest()}
     finally:
@@ -169,7 +360,16 @@ def execute(bridge):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--bridge", type=Path, required=True)
-    bridge = parser.parse_args().bridge
+    parser.add_argument("--child", choices=("snapshots", "publish", "recover"))
+    parser.add_argument("--attempt")
+    parser.add_argument("--metadata")
+    parser.add_argument("--port", type=int)
+    args = parser.parse_args()
+    bridge = args.bridge
+    if args.child:
+        value = child_task(args.child, args.port, args.metadata, args.attempt)
+        print(json.dumps(value, sort_keys=True))
+        return 0
     try:
         result = execute(bridge)
     except BaseException as exc:
