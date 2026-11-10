@@ -1,8 +1,9 @@
 # Native Rebase: Durable Intent And Snapshot Preparation
 
 Status: normal benchmark Rebase is unchanged and native publication is disabled.
-Explicit helpers persist intent, prepare its two snapshots and inspect receipts;
-this is not the complete native Rebase or recovery implementation.
+Explicit helpers persist intent, prepare its two snapshots, inspect receipts
+and implement the disabled candidate publisher; this is not the complete native
+Rebase or recovery implementation.
 
 Base adapter: `c2737beaf503dd1f3208efc457d369040f0aca40` (`mo-opt`). The normal
 `_rebase_impl` and generic benchmark API remain unchanged. Kernel R1 and R2
@@ -184,3 +185,84 @@ older generations, registration changes during lineage resolution, and recovery
 without re-reading current history. These local DB-API/source integration tests
 do not close lifetime, transaction, process-recovery or publication acceptance.
 No result from this preparation stage is a performance sample.
+
+## Disabled Atomic Publication Implementation
+
+Design decision for the next slice: add explicit MO-only publication of one
+already-prepared attempt. Do not route normal benchmark Rebase into it yet.
+The server EXPECT candidate is test-only and default-disabled; the client does
+not activate or bypass that gate. Conflict policy (`fail`, `ours` meaning
+upstream, or `theirs` meaning feature) is fixed in the durable intent before
+snapshot preparation. A callback is rejected before opening a connection.
+Earlier unpublished draft intents without that new optional field mean fail,
+never an inferred policy from the current caller.
+
+Use a fresh existing RC transaction and the established branch-then-attempt
+lock order. Require the original source registration and PREPARING intent,
+canonical candidate name, both CONFIRMED receipts and all four original
+snapshot identities. A current pointer or a visible snapshot is not a terminal
+request receipt. Existing candidates are retained and rejected, not dropped.
+
+Resolve the source's data-table names in that same transaction, omitting only
+the adapter's `_bb_commits`. Unexpected reserved metadata tables are rejected.
+The kernel EXPECT check rejects stale inventories, including races after this
+name read. Run native Rebase with all those user tables and the fixed four
+snapshots; verify its complete typed summary and recheck all four snapshot
+UUID/TS/DB identities after native admission has acquired their protection.
+If a name was rebound before admission, roll the whole candidate back.
+
+The candidate inherits upstream history, but its new base is the actual fixed
+U endpoint retained by R1, not a fictitious candidate pre-replay snapshot.
+Write one rebase marker whose base and previous base both name that U snapshot.
+Append feature commit/merge rows after the original base sequence, with original
+commit IDs and historical snapshot/database names. Use server-side INSERT SELECT
+and ROW_NUMBER, not Python row replay. Allocate marker/append sequences above
+both relevant histories and reject overflow. Record the candidate's schema
+fingerprint with the marker, using the same pure row decoder as legacy history.
+Do not call autonomous `_add_commit`, `_register`, snapshot or drop helpers.
+
+Then update the branch row by exact old database/generation CAS, retire the
+fixed source with DROP in this same transaction and conditionally write its
+COMMITTED result. Acknowledged COMMIT is the publication point. The result
+contains candidate ID/generation, the exact used U database/snapshot/timestamp,
+the native summary and client-observed native SQL duration. Overall elapsed,
+preparation and cleanup are measured separately by callers; no performance
+claim is made by this component.
+
+The real-client fixture reuses the existing SQL integration cluster rather than
+introducing another service lifecycle. Its exclusive test-only EXPECT switch
+is restored at fixture exit. A frozen wrapper stages only the actual native
+attempt module, minimal package initializer, its tiny acceptance script and
+pure-Python PyMySQL sources. The host Python child shares the worker cgroup;
+its interpreter and source hashes are recorded. Native MO continues using the
+unchanged verified rootfs and CGo libraries; no host Python libraries are bound
+into the server namespace. An atomic ready receipt starts the child, and its
+atomic terminal receipt releases the fixture. Both process return codes and
+the exact adapter hash must agree before the wrapper can accept the result.
+Timeout/error terminates and reaps only these exact children.
+
+That fixture checks two publications, actual U base markers, original commit
+identities, reads through retired database snapshots, Merge after the second
+Rebase and precise successful cleanup. It does not by itself test process
+death, cross-CN, whole MatrixOneToolSuite routing or uncertain-result recovery.
+
+The tiny real native-attempt client has passed that selected main path against
+the fixed test-only kernel candidate, including clean process exit and explicit
+resource cleanup. Its first run exposed and fixed recovery's assumption that
+the outer DB-API fetchall container was a list; the exact zero/one-row branch
+checks now also accept PyMySQL's tuple container. This is not kill/unknown-
+commit or cross-CN acceptance. Normal benchmark routing remains unchanged.
+
+An uncertain COMMIT returns UNKNOWN and performs no retry or cleanup. Explicit
+publication refuses a terminal attempt and directs callers to recover the
+original result rather than republish it. An acknowledged pre-commit rollback
+also does not authorize speculative snapshot cleanup; pending attempts remain
+retained until the separate durable abort-proof path is implemented. This is a
+conservative unfinished recovery state, not full R2 acceptance.
+
+Review decision: PASS for this disabled implementation slice. Offline DB-API
+tests must cover same-owner order, policy binding, fixed endpoint identity,
+history/base correctness, exact CAS/affected rows, overflow, rollback at each
+mutation, and unknown commit without retry. Real adapter subprocess tests,
+continuous Rebase/Merge/history and recovery are mandatory before enabling the
+normal path. A model PASS does not establish storage atomicity or completion.

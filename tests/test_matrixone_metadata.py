@@ -44,7 +44,8 @@ def test_native_intent_binds_base_direction_and_resolved_generations(child_is_fe
                                    else (parent_base, child_base))
     store.prepare.assert_called_once_with(
         "feature", "upstream", source_registration=source, upstream_registration=upstream,
-        feature_base=feature_base, upstream_base=upstream_base, base_sequence=123)
+        feature_base=feature_base, upstream_base=upstream_base, base_sequence=123,
+        on_conflict="fail")
     s._base_rows.assert_called_once_with(source[0], upstream[0])
 
 

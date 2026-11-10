@@ -146,6 +146,20 @@ class AttemptStoreTest(unittest.TestCase):
                 self.prepare(*args)
         self.connect.assert_not_called()
 
+    def test_conflict_policy_is_persisted_and_callbacks_fail_before_connection(self):
+        for policy in ("fail", "ours", "theirs"):
+            with self.subTest(policy=policy):
+                self.setUp()
+                value = self.prepare("feature", "main", ATTEMPT, on_conflict=policy)
+                self.assertEqual(value.on_conflict, policy)
+                self.assertEqual(json.loads(self.cur.execute.call_args.args[1][3])["on_conflict"], policy)
+        for policy in (None, "custom", lambda *args: None):
+            with self.subTest(policy=policy):
+                self.setUp()
+                with self.assertRaises(ValueError):
+                    self.prepare("feature", "main", ATTEMPT, on_conflict=policy)
+                self.connect.assert_not_called()
+
     def test_nonfresh_connection_cannot_own_intent_transaction(self):
         self.conn.get_autocommit.return_value = False
         with self.assertRaises(ValueError):

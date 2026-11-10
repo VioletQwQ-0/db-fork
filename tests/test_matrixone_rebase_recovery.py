@@ -44,7 +44,7 @@ class LockedRecoveryTest(unittest.TestCase):
 
     def test_terminal_success_survives_missing_or_advanced_branch(self):
         result = {"candidate_db": intent().candidate_db, "generation": 1}
-        for registrations in ([], [("feature",)]):
+        for registrations in ([], (), [("feature",)], (("feature",),)):
             with self.subTest(registrations=registrations):
                 self.setUp()
                 self.add_recovery(record("COMMITTED", result=result),

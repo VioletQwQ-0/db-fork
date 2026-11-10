@@ -466,7 +466,7 @@ class MatrixOneToolSuite(DBToolSuite):
         from .matrixone_rebase import RebaseAttemptStore
         return RebaseAttemptStore(lambda: connect(None), self._meta_db)
 
-    def _prepare_native_rebase_attempt(self, ref: Ref, onto: Ref):
+    def _prepare_native_rebase_attempt(self, ref: Ref, onto: Ref, on_conflict="fail"):
         """Prepare durable intent only; no snapshot or publication is sent."""
         if ref.commit or onto.commit:
             raise self._unsupported("rebase", "native publication requires branch heads")
@@ -484,11 +484,18 @@ class MatrixOneToolSuite(DBToolSuite):
                                        else (parent_base, child_base))
         return self._rebase_attempt_store().prepare(
             ref.branch, onto.branch, source_registration=source, upstream_registration=upstream,
-            feature_base=feature_base, upstream_base=upstream_base, base_sequence=row["seq"])
+            feature_base=feature_base, upstream_base=upstream_base, base_sequence=row["seq"],
+            on_conflict=on_conflict)
 
     def _request_native_rebase_snapshots(self, attempt_id: str):
         """Disabled-path preparation only; never publishes or retries an attempt."""
         return self._rebase_attempt_store().request_snapshots(attempt_id)
+
+    def _publish_native_rebase_attempt(self, attempt_id: str):
+        """Explicit candidate path only; the ordinary benchmark path stays off."""
+        result = self._rebase_attempt_store().publish(attempt_id)
+        self._current_db = None
+        return result
 
     def list_rebase_attempts(self, branch: str, after=None, limit=100):
         """MO-only bounded inspection; does not create or retry publications."""
@@ -605,15 +612,8 @@ class MatrixOneToolSuite(DBToolSuite):
             "WHERE LOWER(c.table_schema) = LOWER(%s) AND t.table_type = 'BASE TABLE' AND c.table_name NOT LIKE %s "
             "ORDER BY c.table_name, c.ordinal_position",
             (db, META_PREFIX.replace("_", r"\_") + "%")) or []
-        out: dict = {}
-        for table, col, ctype, key in rows:
-            if str(col).startswith("__mo_"):
-                continue
-            t = out.setdefault(str(table), {"cols": {}, "pk": []})
-            t["cols"][str(col)] = str(ctype).lower()
-            if str(key or "").upper() == "PRI":
-                t["pk"].append(str(col))
-        return out
+        from .matrixone_rebase import schema_fingerprint_rows
+        return schema_fingerprint_rows(rows)
 
     def _add_commit(self, db: str, kind: str, message: str, snap, snap_db: str,
                     prev_snap, prev_db, commit_id: str = None, take_snapshot: bool = False,

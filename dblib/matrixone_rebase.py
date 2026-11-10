@@ -1,4 +1,4 @@
-"""Durable intent, snapshot receipts and reconciliation for native MO Rebase.
+"""Durable intent, snapshots, disabled publication and native MO recovery.
 
 The optional snapshot stage does not publish, retire or delete anything. Normal
 benchmark Rebase is unchanged. Publication integration remains disabled until
@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass
 import hashlib
 import json
 import re
+import time
 import uuid
 
 from pymysql.err import OperationalError
@@ -38,6 +39,25 @@ CREATE TABLE IF NOT EXISTS {table} (
     PRIMARY KEY (attempt_id, role)
 )
 """
+
+NATIVE_REBASE_COLUMNS = (
+    "database", "database_id", "base_database", "base_ts", "tables",
+    "feature_changed_keys", "upstream_changed_keys", "conflict_keys",
+    "applied_insert_rows", "applied_update_rows", "applied_delete_rows",
+)
+
+
+def schema_fingerprint_rows(rows):
+    """Decode the shared history fingerprint's catalog projection."""
+    out = {}
+    for table, column, column_type, key in rows:
+        if str(column).startswith("__mo_"):
+            continue
+        entry = out.setdefault(str(table), {"cols": {}, "pk": []})
+        entry["cols"][str(column)] = str(column_type).lower()
+        if str(key or "").upper() == "PRI":
+            entry["pk"].append(str(column))
+    return out
 
 
 class RebaseAttemptUnknown(RuntimeError):
@@ -104,6 +124,7 @@ class RebaseIntent:
     upstream_base: RebaseBase
     base_sequence: int
     protocol: int = 1
+    on_conflict: str = "fail"
 
     def __post_init__(self):
         _attempt_id(self.attempt_id)
@@ -132,6 +153,8 @@ class RebaseIntent:
                 or self.source_db == self.upstream_db
                 or self.feature_snapshot == self.upstream_snapshot):
             raise ValueError("invalid Rebase intent protocol or candidate")
+        if not isinstance(self.on_conflict, str) or self.on_conflict not in ("fail", "ours", "theirs"):
+            raise ValueError("unsupported native Rebase conflict policy")
 
 
 class RebaseAttemptStore:
@@ -235,7 +258,8 @@ class RebaseAttemptStore:
         return RebaseBase(database, snapshot, database_id, snapshot_uuid, ts)
 
     def prepare(self, branch, upstream_branch, attempt_id=None, *, source_registration,
-                upstream_registration, feature_base, upstream_base, base_sequence):
+                upstream_registration, feature_base, upstream_base, base_sequence,
+                on_conflict="fail"):
         """Persist fixed token and resource names before any snapshot request.
 
         This is not a publish operation. Its returned intent must be passed to
@@ -243,6 +267,8 @@ class RebaseAttemptStore:
         """
         _identifier(branch)
         _identifier(upstream_branch)
+        if not isinstance(on_conflict, str) or on_conflict not in ("fail", "ours", "theirs"):
+            raise ValueError("unsupported native Rebase conflict policy")
         attempt_id = _attempt_id(attempt_id if attempt_id is not None else uuid.uuid4().hex)
         for registration in (source_registration, upstream_registration):
             if not isinstance(registration, tuple) or len(registration) != 2:
@@ -288,7 +314,8 @@ class RebaseAttemptStore:
                 attempt_id, branch, source[0], source_id, epoch, gen,
                 self._candidate_database(branch, gen + 1, attempt_id), gen + 1,
                 upstream[0], rows[0][0], f"bb_r2_f_{attempt_id}", f"bb_r2_u_{attempt_id}",
-                self._read_base(cur, feature_base), self._read_base(cur, upstream_base), base_sequence)
+                self._read_base(cur, feature_base), self._read_base(cur, upstream_base), base_sequence,
+                on_conflict=on_conflict)
             cur.execute(f"INSERT INTO {self._attempts} (attempt_id,branch,state,intent_json) "
                         "VALUES (%s,%s,%s,%s)",
                         (attempt_id, branch, "PREPARING", json.dumps(asdict(intent), sort_keys=True)))
@@ -427,6 +454,135 @@ class RebaseAttemptStore:
                 raise RebaseAttemptUnknown(attempt_id) from exc
         return {"attempt_id": attempt_id, "state": "UNKNOWN", "snapshots": receipts}
 
+    def _check_publication_snapshots(self, cur, intent, receipts):
+        if {item["role"] for item in receipts} != {"feature", "upstream"} or any(
+                item["state"] != "CONFIRMED" for item in receipts):
+            raise RebaseAttemptUnknown(intent.attempt_id)
+        fixed = [intent.feature_base, intent.upstream_base]
+        for receipt in receipts:
+            _, database, _ = self._snapshot_spec(intent, receipt["role"])
+            fixed.append(RebaseBase(database, receipt["snapshot_name"], receipt["database_id"],
+                                    receipt["snapshot_uuid"], receipt["snapshot_ts"]))
+        for endpoint in fixed:
+            if self._read_base(cur, (endpoint.database, endpoint.snapshot)) != endpoint:
+                raise ValueError("Rebase publication snapshot identity changed")
+        return next(endpoint for endpoint in fixed[2:] if endpoint.database == intent.upstream_db)
+
+    def publish(self, attempt_id):
+        """Explicit disabled-path publisher; never retries or activates the server.
+
+        Normal benchmark Rebase does not call this until end-to-end acceptance.
+        A terminal/uncertain attempt must be recovered, not published again.
+        """
+        observed = self._inspect(attempt_id)
+        if "intent" not in observed:
+            raise RebaseAttemptUnknown(attempt_id)
+        if observed["state"] != "UNKNOWN":
+            raise ValueError("recover a terminal Rebase attempt instead of republishing")
+        intent = RebaseIntent(**observed["intent"])
+        if intent.candidate_db != self._candidate_database(intent.branch, intent.new_generation, attempt_id):
+            raise ValueError("Rebase candidate does not match its allocated identity")
+        with self._transaction(attempt_id) as cur:
+            self._locked_intent(cur, intent, require_current=True)
+            receipts = self._read_snapshot_requests(cur, intent)
+            upstream = self._check_publication_snapshots(cur, intent, receipts)
+            cur.execute("SELECT dat_id FROM mo_catalog.mo_database "
+                        "WHERE account_id=current_account_id() AND datname=%s", (intent.candidate_db,))
+            if cur.fetchall():
+                raise RebaseAttemptUnknown(attempt_id)
+            cur.execute("SELECT table_name FROM information_schema.tables "
+                        "WHERE LOWER(table_schema)=LOWER(%s) AND table_type='BASE TABLE' "
+                        "ORDER BY table_name", (intent.source_db,))
+            tables = [row[0] for row in cur.fetchall()]
+            if (not tables or len(tables) != len(set(tables)) or "_bb_commits" not in tables
+                    or any(name.startswith("_bb_") and name != "_bb_commits" for name in tables)):
+                raise ValueError("native Rebase requires only its known history metadata")
+            replay = sorted(name for name in tables if name != "_bb_commits")
+            if not replay:
+                raise ValueError("native Rebase requires at least one data table")
+            selection = ",".join(_identifier(name) for name in replay)
+            policy = {"fail": "fail", "ours": "skip", "theirs": "accept"}[intent.on_conflict]
+            query = (f"DATA BRANCH REBASE DATABASE {_identifier(intent.candidate_db)} "
+                     f"FROM {_identifier(intent.source_db)} {{snapshot=%s}} "
+                     f"AGAINST {_identifier(intent.upstream_db)} {{snapshot=%s}} "
+                     f"BETWEEN {_identifier(intent.feature_base.database)} {{snapshot=%s}} "
+                     f"AND {_identifier(intent.upstream_base.database)} {{snapshot=%s}} "
+                     f"TABLES ({selection}) FOR UPDATE EXPECT ({intent.source_id},{intent.source_epoch}) "
+                     f"WHEN CONFLICT {policy}")
+            started = time.perf_counter()
+            cur.execute(query, (intent.feature_snapshot, intent.upstream_snapshot,
+                                intent.feature_base.snapshot, intent.upstream_base.snapshot))
+            rows = cur.fetchall()
+            native_elapsed = time.perf_counter() - started
+            columns = tuple(column[0] for column in cur.description or ())
+            if columns != NATIVE_REBASE_COLUMNS or len(rows) != 1 or len(rows[0]) != len(columns):
+                raise ValueError("invalid native Rebase summary shape")
+            summary = dict(zip(columns, rows[0]))
+            numeric = [value for name, value in summary.items() if name not in ("database", "base_database")]
+            if (any(type(value) is not int or not 0 <= value < 2 ** 64 for value in numeric)
+                    or summary["database"] != intent.candidate_db or summary["database_id"] == 0
+                    or summary["base_database"] != upstream.database or summary["base_ts"] != upstream.snapshot_ts
+                    or summary["tables"] != len(tables)):
+                raise ValueError("native Rebase summary contradicts its fixed inputs")
+            # Native admission now owns snapshot protection in this transaction.
+            # A name rebound before admission must not publish another snapshot.
+            self._check_publication_snapshots(cur, intent, receipts)
+            candidate_log = f"{_identifier(intent.candidate_db)}.`_bb_commits`"
+            source_log = f"{_identifier(intent.source_db)}.`_bb_commits` {{snapshot=%s}}"
+            cur.execute(f"SELECT cast(coalesce(max(seq),0) as signed) FROM {candidate_log}")
+            maximum = cur.fetchall()
+            cur.execute(f"SELECT cast(coalesce(max(seq),0) as signed),count(*) FROM {source_log} "
+                        "WHERE seq>%s AND kind IN ('commit','merge')",
+                        (intent.feature_snapshot, intent.base_sequence))
+            own = cur.fetchall()
+            if (len(maximum) != 1 or len(maximum[0]) != 1 or len(own) != 1 or len(own[0]) != 2
+                    or any(type(value) is not int or value < 0 for value in (*maximum[0], *own[0]))):
+                raise ValueError("invalid Rebase history bounds")
+            marker = max(maximum[0][0], own[0][0], intent.base_sequence) + 1
+            count = own[0][1]
+            if marker + count >= 2 ** 63:
+                raise ValueError("Rebase history sequence exhausted")
+            cur.execute("SELECT c.table_name,c.column_name,c.column_type,c.column_key "
+                        "FROM information_schema.columns c JOIN information_schema.tables t "
+                        "ON t.table_schema=c.table_schema AND t.table_name=c.table_name "
+                        "WHERE LOWER(c.table_schema)=LOWER(%s) AND t.table_type='BASE TABLE' "
+                        "AND c.table_name NOT LIKE %s ORDER BY c.table_name,c.ordinal_position",
+                        (intent.candidate_db, r"\_bb\_%"))
+            schema = schema_fingerprint_rows(cur.fetchall())
+            if set(schema) != set(replay):
+                raise ValueError("native Rebase history schema inventory changed")
+            cur.execute(f"INSERT INTO {candidate_log} "
+                        "(seq,id,kind,message,snap,db,prev_snap,prev_db,ts,schema_json) "
+                        "VALUES (%s,%s,'rebase',%s,%s,%s,%s,%s,NOW(6),%s)", (
+                            marker, attempt_id, "native rebase onto fixed upstream", upstream.snapshot,
+                            upstream.database, upstream.snapshot, upstream.database, json.dumps(schema, sort_keys=True)))
+            if cur.rowcount != 1:
+                raise RuntimeError("Rebase base marker was not inserted exactly once")
+            if count:
+                cur.execute(f"INSERT INTO {candidate_log} "
+                            "(seq,id,kind,message,snap,db,prev_snap,prev_db,ts,schema_json) "
+                            f"SELECT %s+row_number() over(order by seq),id,kind,message,snap,db,prev_snap,prev_db,ts,schema_json "
+                            f"FROM {source_log} WHERE seq>%s AND kind IN ('commit','merge')",
+                            (marker, intent.feature_snapshot, intent.base_sequence))
+                if cur.rowcount != count:
+                    raise RuntimeError("Rebase historical commits were not copied exactly once")
+            cur.execute(f"UPDATE {self._branches} SET db=%s,gen=%s WHERE name=%s AND db=%s AND gen=%s", (
+                intent.candidate_db, intent.new_generation, intent.branch, intent.source_db, intent.old_generation))
+            if cur.rowcount != 1:
+                raise ValueError("Rebase branch generation changed during publication")
+            cur.execute(f"DROP DATABASE {_identifier(intent.source_db)}")
+            result = {"attempt_id": attempt_id, "candidate_db": intent.candidate_db,
+                      "database_id": summary["database_id"], "generation": intent.new_generation,
+                      "upstream_database": upstream.database, "upstream_snapshot": upstream.snapshot,
+                      "upstream_timestamp": upstream.snapshot_ts, "native_summary": summary,
+                      "native_sql_elapsed_sec": native_elapsed}
+            cur.execute(f"UPDATE {self._attempts} SET state=%s,result_json=%s "
+                        "WHERE attempt_id=%s AND state=%s", (
+                            "COMMITTED", json.dumps(result, sort_keys=True), attempt_id, "PREPARING"))
+            if cur.rowcount != 1:
+                raise ValueError("Rebase success record changed during publication")
+        return result
+
     def list_attempts(self, branch, after=None, limit=100):
         """Return a bounded page, including its explicit continuation cursor."""
         _identifier(branch)
@@ -482,7 +638,7 @@ class RebaseAttemptStore:
                 # A terminal attempt remains valid after its branch advances or
                 # is removed. Only the original durable result is authoritative.
                 registrations = cur.fetchall()
-                if registrations not in ([], [(intent.branch,)]):
+                if len(registrations) > 1 or (registrations and registrations[0] != (intent.branch,)):
                     raise ValueError("ambiguous Rebase branch registration")
                 cur.execute(f"SELECT attempt_id,state,intent_json,result_json FROM {self._attempts} "
                             "WHERE attempt_id=%s FOR UPDATE NOWAIT", (attempt_id,))
