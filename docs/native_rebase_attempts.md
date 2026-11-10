@@ -1,395 +1,167 @@
-# Native Rebase: Durable Intent And Snapshot Preparation
+# Restricted Native Rebase
 
-Status: the normal benchmark backend is unchanged. Production native publication
-is disabled. An explicit candidate Suite exposes the public Rebase API for
-controlled correctness and performance qualification only.
+The normal `MatrixOneToolSuite` and registered benchmark backend remain
+unchanged. `NativeRebaseMatrixOneToolSuite` is an explicit candidate subclass;
+it requires the kernel's exclusive test-only EXPECT admission. No production
+switch, fallback to legacy SQL or automatic retry is added.
 
-Base adapter: `c2737beaf503dd1f3208efc457d369040f0aca40` (`mo-opt`). The normal
-`_rebase_impl` and generic benchmark API remain unchanged. Kernel R1 and R2
-integration have independent source identities and acceptance requirements.
+Support same-tenant, same-schema ordinary primary-key tables. Unchanged no-PK
+tables require full visible multiset equality in the kernel. Changed no-PK data,
+unsupported schema, pinned endpoint requests and custom conflict callbacks are
+rejected. `ours` keeps fixed upstream; `theirs` keeps feature. The public API
+inherits the existing timer, collector and error reporting and labels only the
+candidate subclass as native.
 
-## Explicit Public API
+## Durable Objects And Owners
 
-`dblib.matrixone_native_rebase.NativeRebaseMatrixOneToolSuite` is an opt-in
-subclass, not a registered benchmark backend. It inherits the real public
-`rebase()` timer, collector and error reporting, with a native implementation
-label only on this class. The default `MatrixOneToolSuite` remains simulated.
-The candidate requires the qualified server's test-only EXPECT admission;
-there is no new production switch or silent compatibility fallback.
+`RebaseAttemptStore` owns a fresh connection per call. The benchmark's existing
+metadata database owns attempts and snapshot request receipts. No credentials,
+process-local result or external branch platform is used as publication truth.
 
-The public path prepares one durable attempt, requests its fixed snapshots,
-and claims and publishes it once. It never falls back to legacy SQL, creates a
-replacement attempt on failure, or retries an unknown result. Pinned endpoints
-and custom conflict callbacks are rejected before intent or snapshot creation.
-`ours` retains the fixed upstream and `theirs` retains the branch. Result counts
-map to upstream/feature changed keys and conflict keys; the result also retains
-the original attempt ID, fixed upstream identity and native statement timing.
+An immutable intent binds a 128-bit attempt ID, logical branch, source DB ID,
+old/new generation, source epoch, upstream identity, original base sequence and
+all four endpoint identities. Snapshot identities include name, UUID, timestamp
+and database ID. Candidate/snapshot names are allocated once from the attempt
+and stay within the server's identifier limit. New attempts reject overflow.
 
-The real public-API fixture covers consecutive feature publications, Rebase of
-main onto its child, old-generation historical reads, Merge, both policies and
-unsupported no-SQL rejection. This is separate from the prior helper-only
-fixture and real client-death acceptance. Neither class performs automatic
-snapshot reclamation. UNKNOWN resources and historical snapshot references are
-retained; fixture-local terminal cleanup is not production GC qualification.
+Resolve the legacy lineage once and pass both observed registrations into
+`prepare`. Under the branch lock, revalidate registrations and original base
+snapshots before inserting PREPARING. Missing or rebound endpoints fail; there
+is no two-way/no-base fallback. Old unreleased incomplete intents cannot invent
+bases during recovery. A PREPARING, PUBLISHING or UNKNOWN attempt fences new
+attempt preparation for that logical branch.
 
-## Single-Send Publication And Proven Rollback (Current Slice)
+All metadata transactions lock branch registration before attempt. A helper
+must not call autonomous `_add_commit`, `_register`, snapshot or DROP operations
+inside publication. Unknown COMMIT responses retain the original attempt ID.
 
-Design decision: PREPARING alone cannot distinguish a never-sent publication
-from a lost request result. Before native SQL, a separate branch-then-attempt
-transaction consumes PREPARING into PUBLISHING, after both independent snapshots
-are CONFIRMED. Only the caller that acknowledged this claim may send publication.
-A second publisher cannot consume PUBLISHING, including after client death.
-New intent preparation under the same branch lock refuses any PREPARING,
-PUBLISHING or UNKNOWN attempt and returns its original ID for recovery.
+## Snapshot Request Protocol
 
-The data/base/history/CAS/retirement/COMMITTED write remains one transaction;
-its conditional success row now requires PUBLISHING. Recovery maps PUBLISHING
-to UNKNOWN and never sends SQL again. A claim COMMIT with unknown response sends
-no native SQL. A publication COMMIT with unknown response does not roll back,
-retry or abort. No wall-clock timeout or missing candidate proves rollback.
+The intent commits before either independent snapshot request. There are at
+most two receipts, keyed by attempt ID and role (`feature`/`upstream`).
 
-Only an acknowledged rollback of that exact publication owner plus both durable
-CONFIRMED snapshot receipts allows a new branch-then-attempt transaction to
-record ABORTED. A failed/unknown rollback or abort commit stays UNKNOWN. Abort
-does not delete any snapshot/database or prove reference-safe GC. Interrupted
-clients have no durable rollback acknowledgement, so remain UNKNOWN. These
-transitions do not enable production or normal benchmark routing.
+1. Lock branch then attempt, verify its generation and both original bases.
+2. Insert REQUESTED with the preallocated resource identity and commit it.
+3. Only the caller that acknowledged that reservation sends CREATE SNAPSHOT.
+4. After its successful response, verify the current account's UUID/TS/DB
+   identity and commit CONFIRMED under the same lock order.
 
-Required tests: single claim, both uncertain COMMIT boundaries, known/unknown
-rollback, abort failure, pending-branch retry refusal, real client SIGKILL and
-unchanged atomic publication/history oracles. Offline tests and the real adapter
-process fixture cover this closure, including killed-client non-republication,
-known ABORTED recovery and new-intent admission only after proven abort. This is
-not normal Suite API or production reference-safe GC acceptance.
+An unknown reservation commit sends no request. Existing REQUESTED is UNKNOWN,
+not permission to issue it again. A matching CONFIRMED receipt can be reused
+without another request. Upstream preparation requires confirmed feature.
+Confirmation does not require the branch still to be current; publication must
+check that separately. Errors or client death after REQUESTED retain resources.
+Catalog absence cannot distinguish never-sent from still-running requests.
+Endpoint lifetime is protected by kernel publication admission, not this early
+catalog check.
 
-## Invariants And Ownership
+## Exactly-One Sender And Atomic Publication
 
-`RebaseAttemptStore` owns one fresh connection per call. `prepare` commits a
-`PREPARING` row in the existing benchmark metadata database before returning a
-fixed source token, generation and resource names. `prepare` itself sends no
-snapshot or publication. The source branch row is locked while the intent is
-assembled; source inventory is scoped by account and database ID. Later
-publication must revalidate both the token and registry relation.
+PREPARING alone cannot prove whether a publication was already sent. A separate
+branch-then-attempt transaction checks both CONFIRMED receipts and consumes
+PREPARING as PUBLISHING. Only its acknowledged claimant sends native SQL once.
+A second caller cannot consume PUBLISHING, including after client death.
 
-The immutable intent also binds both old base endpoints, their database IDs,
-snapshot UUIDs/timestamps, and the base log sequence. The adapter uses its
-existing lineage resolver once and passes the two observed registrations to
-`prepare`; a changed source or upstream generation rejects that stale
-resolution. In the intent transaction, both base snapshots must exist in the
-current account and match their recorded database names. No two-way/no-base
-fallback is allowed on this restricted native path. Recovery decodes these
-original endpoints, never chooses a new fork point from current history.
-This is identity validation, not yet snapshot lifetime/GC protection; the
-kernel must protect and validate the exact endpoints before publication.
-Incomplete intents from the earlier, unreleased draft are rejected without
-inventing bases or deleting resources. The production benchmark path is
-unchanged and does not invoke this preparation helper.
+The fresh Pessimistic-RC publication owner then:
 
-An attempt ID is a full 128-bit identifier. Its candidate and snapshot names
-are allocated once and remain within the server's 64-character limit. Epoch
-exhaustion and generation overflow fail before the intent insert. Failed
-pre-commit preparation rolls back. Once COMMIT is sent, an exception means
-`RebaseAttemptUnknown(attempt_id)`, not a retry, rollback claim or cleanup.
+1. Locks branch then attempt; checks PUBLISHING, source ID/generation, candidate
+   identity and both confirmed receipts. Existing candidates are never dropped
+   as a retry strategy.
+2. Resolves data tables, omitting only known `_bb_commits`; rejects unknown
+   reserved metadata. Calls native Rebase with fixed four snapshots, table
+   selection and `FOR UPDATE EXPECT (source_id, source_epoch)`.
+3. Checks the complete typed summary and rechecks snapshot identities after
+   native admission has acquired protection. The source epoch and separate
+   table-data dependencies protect directory and DML races respectively.
+4. Records the actual fixed U snapshot as the new base. Appends feature
+   commit/merge history after the original base using server-side INSERT SELECT
+   and ROW_NUMBER, preserving original commit IDs and historical endpoints.
+   Sequence allocation and affected counts are checked.
+5. CAS-updates the branch DB/generation, logically retires the old source and
+   writes COMMITTED with the result, all in that same owner.
 
-Intent preparation mutates only benchmark metadata. The separately invoked
-snapshot stage creates only its two preallocated snapshots. The metadata
-database and its permissions remain owned by the benchmark instance, not by
-an unprivileged external caller.
-No credentials or connection strings are recorded in the intent.
+Acknowledged COMMIT is publication success. The stored result includes attempt,
+candidate ID/generation, exact U database/snapshot/timestamp, native summary and
+client-observed native SQL time. The public result maps upstream/feature/conflict
+key counts without losing that durable identity.
 
-## Inspection Contract
+On acknowledged publication rollback, and only with both CONFIRMED requests,
+the original publisher may record ABORTED in a new branch-then-attempt owner.
+An unknown claim, publication COMMIT, rollback or abort COMMIT stays UNKNOWN.
+Neither ABORTED nor success authorizes speculative physical cleanup.
 
-- `list_rebase_attempts(branch, after=None, limit=100)` returns at most 100 rows
-  with an explicit ID-ordered continuation cursor. It does not create tables.
-- `recover_rebase(attempt_id)` first reads the immutable intent, then uses a
-  fresh RC transaction to lock the branch registration before the attempt row
-  and reread the original result and its at most two snapshot receipts. Both
-  locking reads use NOWAIT: a busy publisher returns `UNKNOWN`, not a stalled
-  recovery operation or rollback inference. Lock-wait timeout, deadlock and
-  uncertain recovery-transaction completion also remain `UNKNOWN`; other
-  read errors propagate. Absent, `PREPARING`, `PUBLISHING` or `UNKNOWN` records return
-  `UNKNOWN`. A stored `COMMITTED` result survives an advanced or removed
-  current branch registration; recovery never derives its outcome from the
-  current pointer. Changed immutable identity or terminal evidence is rejected.
-- Corrupt identity, generation, state or result data is rejected. Neither
-  inspection method publishes, retries, aborts, drops or reclaims anything.
+## Inspection And Recovery
 
-Locked confirmation still cannot establish that an independent snapshot request
-has ended. It cannot transition a pending row to `ABORTED` or authorize resource
-deletion. The preparation stage uses non-locking inspection only to discover the
-intent before its separate branch/attempt-locked request admission; this is not
-a second recovery or publishing API.
+- `list_rebase_attempts(branch, after=None, limit=100)` reads a bounded ID-ordered
+  page and explicit continuation cursor. It creates no tables.
+- `recover_rebase(attempt_id)` opens a fresh RC connection, locks branch then
+  attempt with NOWAIT and rereads durable state/at most two receipts.
+- Busy publisher, lock timeout/deadlock or uncertain recovery completion returns
+  UNKNOWN. Other read errors propagate. No publication is sent by recovery.
+- A matching COMMITTED result is returned even after the branch advances or its
+  current registration disappears. Current-pointer inference is not evidence of
+  an earlier success. Corrupt immutable/terminal state is rejected.
+- Pending state, snapshot visibility, elapsed time and disconnect are not rollback
+  evidence. Recovery cannot automatically mark them ABORTED or delete resources.
 
-## Required Publication Integration
+Native generation names are opaque to legacy name parsing. Resolve at most the
+four relevant names by their embedded attempt IDs and primary-key reads. Only
+matching immutable intent plus COMMITTED result establishes logical identity.
+Pending/absent state remains UNKNOWN; corrupt/aborted identity fails. Legacy
+names and the known benchmark root keep their existing behavior.
 
-Before enabling native Rebase, implement and validate all of the following:
+## Retirement And Resource Lifetime
 
-1. Record confirmed snapshot identities and terminal request evidence in the
-   persistent attempt. A request without a proven terminal outcome remains
-   `UNKNOWN`, including when the client dies or the snapshot is not yet visible.
-2. In the existing Pessimistic+RC publication transaction, lock the branch row
-   before the attempt row. Validate generation, database identity and fixed
-   inventory token. Commit epoch reservation, replayed candidate, new base,
-   history, pointer CAS, source retirement and `COMMITTED` result together.
-3. The locked confirmation path must pass real-client competition and process
-   recovery tests. An eventual transition to `ABORTED` requires publication
-   rollback and all independent snapshot requests to have confirmed terminal
-   states. Missing metadata, disconnect or lock timeout is not such evidence.
-4. Keep old generations and snapshots until historical and active references
-   prove reclamation safe. No sweeper or unbounded automatic retry is added.
+The old source DROP is logical retirement in the publication transaction.
+Historical snapshots keep earlier generations readable. Unknown resources,
+historical references and imported objects are retained until safe reclamation
+can be proved; there is no production sweeper or cleanup inference from a dead
+client. Successful integration fixtures may remove their exact private objects
+after independently observing terminal requests and closing all clients. That
+teardown is not production reference-safe GC qualification.
 
-The common catalog producer coverage, shutdown upgrade and cross-CN conflict
-proof are prerequisites; intent persistence alone does not close the lost-table
-counterexample or qualify R2 concurrency safety.
+## Verification
 
-## Design Decision And Verification
+Offline DB-API tests cover transaction ownership, branch/attempt order, exact
+identity/counts, SQL quoting, corrupted records, single send, overflow, rollback,
+both uncertain COMMIT boundaries and connection release. They do not establish
+storage conflicts or actual process recovery.
 
-Selected persistent database records over current-pointer inference (which
-cannot prove an earlier success) or local client files (which do not survive
-client loss and cannot commit atomically with publication). A general branch
-service or background recovery manager is not required for this benchmark-owned
-protocol. These decisions follow the restricted R2 plan; this slice does not
-select a different publication algorithm.
+Real integration scripts use the exclusive kernel SQL fixture:
 
-Offline tests exercise DB-API call ordering, parameter binding, boundaries,
-commit uncertainty, connection cleanup and read-only inspection. They do not
-prove transaction conflicts, WAL recovery or actual adapter process death.
-The separate integration fixtures provide real-database and real-process
-acceptance for their explicitly selected contracts. Offline tests alone do not
-provide those claims. Performance is measured separately, never from fixture
-wall time or SQL-count reduction alone.
+- Publication: two consecutive Rebase operations, exact new bases/history,
+  Merge, both conflict policies and multi-table late failure rollback.
+- Public Suite: the actual constructor, collector, branch/commit/rebase/history
+  path, reverse main direction and unsupported no-SQL rejection.
+- Process recovery: actual adapter SIGKILL at three deterministic packet barriers:
+  snapshot OK held before delivery, publication COMMIT held before forwarding,
+  and server COMMIT OK held before delivery. Fresh interpreters receive only the
+  metadata DB and original attempt ID. Independently prove server commit in the
+  last case; a Python exception after receiving COMMIT is not equivalent.
 
-The locked-recovery tests additionally cover branch-before-attempt NOWAIT,
-pending-to-committed rereads, missing/advanced registration, both busy lock
-positions, release uncertainty, immutable-identity/terminal-result corruption,
-and retained pending resources. These are offline owner/ordering oracles, not
-proof that two actual database transactions conflict or that a killed client
-recovers safely. Inspection stays read-only. Only the publisher's acknowledged
-rollback and confirmed-request path may write ABORTED; it reclaims no resources.
+The bounded loopback test relay has packet/connection limits, never records
+authentication and joins all owned workers on failure. Receipt observation is
+not sleep-based synchronization of competing database transactions. Pending
+kill cases remain UNKNOWN; confirmed post-commit death recovers COMMITTED once.
 
-## Native Generation Identity
+Kernel catalog-producer, data-race, cross-CN, WAL/checkpoint, upgrade and snapshot
+protection evidence is separate. Selected client PASS is not automatic kernel,
+production or cleanup acceptance. Qualification results and identities stay in
+external artifacts, not an append-only history in this design.
 
-The allocated candidate name is opaque to the legacy `branch_of_db` parser.
-That parser alone cannot relate a previous native upstream generation to its
-current generation during subsequent Rebase or Merge. Resolve the bounded set
-of relevant native names through their embedded attempt IDs and the existing
-attempt-table primary key, not by scanning history or adding a mapping table.
-Only immutable intent plus a matching COMMITTED result may identify a published
-generation. Verify the exact allocated name, metadata namespace and generation;
-pending/missing records remain UNKNOWN, and corrupt/aborted identities fail.
-Never fall back to string-derived branch identity for a recognized native name.
+## Performance Recipe
 
-The lineage caller resolves at most four names in one read, uses an operation-
-local map, and keeps the legacy path unchanged when no native names occur.
-The known benchmark root is never classified as a native generation, even if
-its chosen literal name happens to match that shape.
-Old generation identity survives current-pointer advances or physical database
-retirement because its successful attempt remains durable. This read-only
-identity slice is not a GC authorization, native publication or proof of the
-future base/history-writing protocol. Real repeated Rebase, subsequent Merge
-and lifecycle acceptance remain required before enabling R2.
+`tests/integration_native_rebase_benchmark.py` compares the actual old/native
+public methods against the same qualified server build and frozen adapter.
+Use small legacy/native followed by W1 native/legacy, one serial worker,
+16 spine branches, seed42, one excluded warmup and ten measured calls per arm.
+Each call prepares a child and commits one disjoint INSERT on each side, matching
+the upstream fixture recipe. W1 preserves all twelve tables and pinned seed.
 
-## Snapshot Request Owner
-
-The next isolated stage adds at most two request rows per attempt in the same
-benchmark metadata database, keyed by `(attempt_id, role)`. This keeps the
-immutable intent and terminal publication result separate from independently
-committed snapshot receipts without an ALTER of already-created attempt rows.
-Only `feature` and `upstream` roles are accepted. Their names and database IDs
-come from the committed intent; no retry generates a new resource name.
-
-Before sending CREATE SNAPSHOT, a fresh metadata transaction locks the branch
-registration row and then the original attempt row, checks its generation and
-database identity, and inserts `REQUESTED`. It commits before opening the
-autocommit snapshot-request connection. A failed/unknown reservation commit
-sends no snapshot request. A pre-existing REQUESTED row is UNKNOWN and must not
-be reissued; a valid CONFIRMED row may be reused without another CREATE.
-Upstream preparation requires a confirmed feature receipt.
-
-Before inserting a new REQUESTED row, the same metadata owner checks both
-original base snapshot identities against the immutable intent. Missing or
-rebound names stop this preparation, including between the feature and upstream
-requests; already-confirmed feature resources are retained. Reusing a confirmed
-receipt does not create another request. This early check does not pin snapshots
-against later GC or replace the publication transaction's protected endpoint
-validation. A read error is not ABORTED evidence and never triggers cleanup.
-
-After a successful snapshot response, query its UUID, timestamp and database ID
-from the current account's snapshot catalog. Verify level/name/ID against the
-intent and persist a CONFIRMED receipt under the same branch-before-attempt
-lock order. Receipt confirmation does not publish a branch and therefore does
-not require the current branch generation to remain unchanged; the later
-publication transaction must still validate it. Any failure after REQUESTED
-was committed conservatively retains the record and resources. In particular,
-client death before send is indistinguishable on restart from an in-flight
-request; catalog absence is not proof of rollback.
-
-Inspection may return the two bounded receipts but still reports UNKNOWN for
-an unpublished attempt, even when both snapshots are confirmed. No ABORTED,
-snapshot deletion, retry scheduler or publication is introduced. The normal
-benchmark Rebase stays unchanged. The component and its offline ordering/error
-tests may be developed independently; real request and adapter-process exits
-remain required before R2 acceptance. This owner design is accepted for the
-disabled adapter stage, not evidence of runtime correctness.
-
-The focused offline suites cover acknowledged reservation before request,
-branch/attempt lock order, independent autocommit requests, confirmed receipt
-reuse, commit uncertainty, stale generations, corruption and connection release.
-The adapter metadata cases also check both child/parent orientations, bases in
-older generations, registration changes during lineage resolution, and recovery
-without re-reading current history. These local DB-API/source integration tests
-do not close lifetime, transaction, process-recovery or publication acceptance.
-No result from this preparation stage is a performance sample.
-
-## Disabled Atomic Publication Implementation
-
-Design decision for the next slice: add explicit MO-only publication of one
-already-prepared attempt. Do not route normal benchmark Rebase into it yet.
-The server EXPECT candidate is test-only and default-disabled; the client does
-not activate or bypass that gate. Conflict policy (`fail`, `ours` meaning
-upstream, or `theirs` meaning feature) is fixed in the durable intent before
-snapshot preparation. A callback is rejected before opening a connection.
-Earlier unpublished draft intents without that new optional field mean fail,
-never an inferred policy from the current caller.
-
-Use the established branch-then-attempt lock order to claim PREPARING into
-PUBLISHING before native SQL. The fresh RC publication transaction requires the
-original source registration and that PUBLISHING intent,
-canonical candidate name, both CONFIRMED receipts and all four original
-snapshot identities. A current pointer or a visible snapshot is not a terminal
-request receipt. Existing candidates are retained and rejected, not dropped.
-
-Resolve the source's data-table names in that same transaction, omitting only
-the adapter's `_bb_commits`. Unexpected reserved metadata tables are rejected.
-The kernel EXPECT check rejects stale inventories, including races after this
-name read. Run native Rebase with all those user tables and the fixed four
-snapshots; verify its complete typed summary and recheck all four snapshot
-UUID/TS/DB identities after native admission has acquired their protection.
-If a name was rebound before admission, roll the whole candidate back.
-
-The candidate inherits upstream history, but its new base is the actual fixed
-U endpoint retained by R1, not a fictitious candidate pre-replay snapshot.
-Write one rebase marker whose base and previous base both name that U snapshot.
-Append feature commit/merge rows after the original base sequence, with original
-commit IDs and historical snapshot/database names. Use server-side INSERT SELECT
-and ROW_NUMBER, not Python row replay. Allocate marker/append sequences above
-both relevant histories and reject overflow. Record the candidate's schema
-fingerprint with the marker, using the same pure row decoder as legacy history.
-Do not call autonomous `_add_commit`, `_register`, snapshot or drop helpers.
-
-Then update the branch row by exact old database/generation CAS, retire the
-fixed source with DROP in this same transaction and conditionally write its
-COMMITTED result. Acknowledged COMMIT is the publication point. The result
-contains candidate ID/generation, the exact used U database/snapshot/timestamp,
-the native summary and client-observed native SQL duration. Overall elapsed,
-preparation and cleanup are measured separately by callers; no performance
-claim is made by this component.
-
-The real-client fixture reuses the existing SQL integration cluster rather than
-introducing another service lifecycle. Its exclusive test-only EXPECT switch
-is restored at fixture exit. A frozen wrapper stages only the actual native
-attempt module, minimal package initializer, its tiny acceptance script and
-pure-Python PyMySQL sources. The host Python child shares the worker cgroup;
-its interpreter and source hashes are recorded. Native MO continues using the
-unchanged verified rootfs and CGo libraries; no host Python libraries are bound
-into the server namespace. An atomic ready receipt starts the child, and its
-atomic terminal receipt releases the fixture. Both process return codes and
-the exact adapter hash must agree before the wrapper can accept the result.
-Timeout/error terminates and reaps only these exact children.
-
-That fixture checks two publications, actual U base markers, original commit
-identities, reads through retired database snapshots, Merge after the second
-Rebase and precise successful cleanup. It does not by itself test process
-death, cross-CN, whole MatrixOneToolSuite routing or uncertain-result recovery.
-
-The tiny real native-attempt client has passed that selected main path against
-the fixed test-only kernel candidate, including clean process exit and explicit
-resource cleanup. Its first run exposed and fixed recovery's assumption that
-the outer DB-API fetchall container was a list; the exact zero/one-row branch
-checks now also accept PyMySQL's tuple container. This is not kill/unknown-
-commit or cross-CN acceptance. Normal benchmark routing remains unchanged.
-
-An uncertain COMMIT returns UNKNOWN and performs no retry or cleanup. Explicit
-publication refuses a terminal attempt and directs callers to recover the
-original result rather than republish it. An acknowledged publication rollback
-with both requests CONFIRMED can now persist ABORTED through the single-send
-protocol. This still does not authorize speculative snapshot cleanup or establish
-full R2 acceptance.
-
-Review decision: PASS for this disabled implementation slice. Offline DB-API
-tests must cover same-owner order, policy binding, fixed endpoint identity,
-history/base correctness, exact CAS/affected rows, overflow, rollback at each
-mutation, and unknown commit without retry. Real adapter subprocess tests,
-continuous Rebase/Merge/history and recovery are mandatory before enabling the
-normal path. A model PASS does not establish storage atomicity or completion.
-
-## Deterministic Real-Client Failure Acceptance
-
-The next test-only slice reuses that same private cluster and starts actual
-adapter subprocesses. A bounded plaintext MySQL packet relay is necessary to
-distinguish a server COMMIT from receipt of its response; a Python exception
-after conn.commit() would not establish the requested lost-response condition.
-The relay is fixture code only, binds loopback, admits at most8 connections and
-limits a packet to1MiB. It forwards authentication without recording it and
-logs only COM_QUERY SQL from the private test. It does not parse general SQL.
-
-Three observable barriers drive exact-child SIGKILL, never scheduler sleeps:
-- snapshot: the exact preallocated CREATE SNAPSHOT has a server OK held before
-  forwarding to the child; its durable request remains REQUESTED;
-- before_commit: after the publication success-row UPDATE, hold its COMMIT
-  request before forwarding; a fresh recovery must see the busy publisher as
-  UNKNOWN, then child death/backend closure must leave source/epoch/pointer
-  unchanged and candidate absent;
-- after_commit: forward that COMMIT and hold its server OK before the child
-  receives it; a direct independent query must prove COMMITTED before killing
-  the child, then a fresh Python process must return that exact durable result
-  without another publication or cleanup.
-
-Each barrier is acknowledged by the relay, including whether the request was
-forwarded/OK withheld. Recovery starts a new interpreter with only connection
-configuration, metadata DB and original attempt ID; no returned in-memory
-intent/result is supplied. Record exact owned PIDs and reap/close all relay
-threads/connections even on failure. Busy-state observation uses NOWAIT and
-bounded polling only for actual asynchronous lock release after disconnect.
-It is not a retry of a publication.
-
-The pending snapshot case stays UNKNOWN even if a snapshot is visible. The
-pending pre-commit case also remains conservatively UNKNOWN with the current
-recover interface; this does not qualify a durable ABORTED/production cleanup
-path. Fixture teardown can use its independently observed terminal server OK,
-dead clients/closed backend and released publication locks to remove only its
-private resources. It is not authorization for production recovery to infer
-rollback from disconnect or catalog absence.
-
-Add a two-PK-table conflict case: first sorted table has a valid feature change,
-second has conflicting edits. The existing native applied-table hook records
-that the first table was actually processed before the error. Independently
-assert complete source/upstream rows, original epoch/registration, no candidate
-and an ABORTED attempt with both confirmed receipts after rollback is acknowledged.
-No full-data scale or new service fixture is needed.
-
-Review decision: PASS for these test-only owner/transport closures. Unit tests
-must prove fragmentation, unchanged pass-through, request-vs-response barriers,
-wrong server response refusal and exact shutdown. Real-process evidence is
-still required; proxy unit tests do not replace it. Existing resource gates and
-exclusive lease remain in force, and production R2 stays disabled.
-
-## Actual ToolSuite Call-Chain Acceptance
-
-The ToolSuite fixture uses the unchanged MatrixOneToolSuite constructor, branch and
-commit API, schema fingerprint, real ResultCollector and generation resolution.
-Its native publication is the existing explicit MO helper chain (prepare,
-request snapshots, publish), not the ordinary legacy rebase route. No generic
-API/default routing or server activation is changed by this fixture.
-
-Create tiny explicit-PK data and an unchanged duplicate/NULL bag, make actual
-fork/commit history, publish twice after independent upstream/feature edits,
-then Merge using the real Suite method. Check complete rows, old commit refs,
-the first durable result after the branch advances, base direction and the
-second delta window. Two further source branches conflict on one key and
-prove ours=upstream and theirs=feature. Track SQL-issued fixture snapshots and
-known databases exactly; no database/snapshot cleanup follows failed evidence.
-Success closes the Suite before explicit resource teardown and confirms every
-owned user snapshot/database absent. This is still not production GC or a
-performance experiment. Linux client dependencies are pinned by wheel hashes;
-no database, driver, ledger, ResultCollector or protobuf module is mocked.
+Check table counts, exact changed-key results and native durable outcomes. This
+is not a full-content digest of every W1 branch. Report adapter verb latency,
+native SQL client time, actual timed SQL requests, seed/spine/operation setup
+and cleanup separately. Flush operation evidence outside timing. Failures and
+unsupported calls are not samples. One pair on a shared serial server, including
+retained metadata/cache from earlier arms, cannot establish significance or a
+single-patch causal speedup. Fewer SQL requests alone is not a performance win.
